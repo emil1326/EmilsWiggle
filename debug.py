@@ -196,6 +196,7 @@ def build_report(context):
                 f" last frame {rig.last_frame}, cached {len(rig.cache)}, approx {_yes(rig.approx)},"
                 f" fast preview {'ok' if rig.fast_ok else 'no (' + rig.fast_reason + ')'},"
                 f" settings animated {_yes(rig.settings_animated)},"
+                f" blew up {rig.blowups}x (last frame {rig.blowup_frame}, {rig.blowup_bones[:6]}),"
                 f" colliders {sorted(rig.colliders) or '-'}, winds {sorted(rig.winds) or '-'}")
             ob = scene.objects.get(rig.name)
             for b in rig.bones:
@@ -218,8 +219,12 @@ def build_report(context):
                 s_b = pb.emils_wiggle
                 if b.has_tail:
                     lines.append(f"      tail: {_side_text(s_b.tail)}")
+                    for _icon, title, detail in runtime.side_warnings(scene, s_b.tail):
+                        lines.append(f"        ! {title} {detail}")
                 if b.has_head:
                     lines.append(f"      head: {_side_text(s_b.head)}")
+                    for _icon, title, detail in runtime.side_warnings(scene, s_b.head, head=True):
+                        lines.append(f"        ! {title} {detail}")
     lines.append("recent frames:")
     runs = []  # consecutive frames that did the same thing get one line
     for frame, rig_name, what in runtime.history:

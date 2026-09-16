@@ -135,6 +135,8 @@ The code is split up like this:
 
 ## When something acts weird
 
+First, look at the panel. If a value makes no sense (Bounce or Friction over 1 with a collider, a gravity or wind that would throw the bone off, a bone or armature scaled to 0), the bone's Tail/Head section says so in red. It also tells you when Stiff or Damp are past the point where they change anything, since that depends on your frame rate, substeps and quality. And if the sim blows up anyway, it starts over from rest instead of sending bones to infinity, and the main panel shows how many times, on which frame and which bones.
+
 Turn on **Developer Tools** in Preferences > Add-ons > Emil's Wiggle. A **Debug** panel shows up at the bottom, with counters (including why the cache got cleared), the playback fps and a **Copy Debug Report** button. The report has the settings of every wiggle bone, what the last frames did (cache, sim, fast preview, render...) and the last error, so paste that along with what you saw.
 
 If Blender straight up crashes, there's a **Crash Log** too (on by default, same preferences). It only writes something when Blender dies, and then it says what Python was doing at that exact moment, which Blender's own crash file usually doesn't. It lives at `%TEMP%\emils_wiggle_crash.log`, and the Debug panel has a button to open it.
@@ -149,7 +151,7 @@ Two suites, both run with one command (plain Python, it finds Blender 3.6 by its
 python tests/run_all.py
 ```
 
-The background one builds rigs, plays them, renders with Cycles and Workbench, saves and reloads, bakes and draws every panel (134 passed last run on Blender 3.6.23). Background mode can't do real playback or threaded renders though, so the second one opens its own little Blender window, plays, stops, does a Ctrl+F12 with and without the cache plus an F12, copies and switches scenes, exports an Alembic in the background, sits still to let the Background Cache work, plays with frames dropping, checks everything and closes itself (33 passed). `--headless` or `--gui` runs just one of them, `-v` shows every check.
+The background one builds rigs, plays them, renders with Cycles and Workbench, saves and reloads, bakes and draws every panel (146 passed last run on Blender 3.6.23). Background mode can't do real playback or threaded renders though, so the second one opens its own little Blender window, plays, stops, does a Ctrl+F12 with and without the cache plus an F12, copies and switches scenes, exports an Alembic in the background, sits still to let the Background Cache work, plays with frames dropping, checks everything and closes itself (33 passed). `--headless` or `--gui` runs just one of them, `-v` shows every check.
 
 Every bug that gets fixed gets its own test in there too, so it can't sneak back in.
 

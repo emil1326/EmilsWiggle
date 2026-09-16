@@ -26,9 +26,22 @@ def _wiggle2_active(scene):
     return legacy.wiggle2_active() and bool(getattr(scene, "wiggle_enable", False))
 
 
+def draw_lines(layout, icon, *lines):
+    """A warning over a few short lines, the sidebar is narrow."""
+    col = layout.column(align=True)
+    for i, text in enumerate(lines):
+        col.label(text=text, icon=icon if i == 0 else "BLANK1")
+
+
+def draw_warnings(layout, items):
+    for icon, title, detail in items:
+        draw_lines(layout, icon, title, detail)
+
+
 def draw_side(layout, context, side, is_tail):
     layout.use_property_split = True
     layout.use_property_decorate = False
+    draw_warnings(layout, runtime.side_warnings(context.scene, side, head=not is_tail))
 
     col = layout.column(align=True)
     col.prop(side, "mass")
@@ -120,6 +133,19 @@ class EMILSWIGGLE_PT_main(EmilsWigglePanel, bpy.types.Panel):
         if os_.mute:
             row.label(text="Armature muted")
             return
+        rt_rig = rt.rigs.get(ob.name) if rt is not None else None
+        if runtime.zero_scale(ob.matrix_world):
+            draw_lines(layout, "ERROR", "Armature scaled to 0", "it can't wiggle")
+        if rt_rig is not None and rt_rig.blowups:
+            box = layout.box()
+            times = "once" if rt_rig.blowups == 1 else f"{rt_rig.blowups} times"
+            names = rt_rig.blowup_bones
+            lines = [f"Blew up {times}", f"last on frame {rt_rig.blowup_frame}"]
+            lines += [", ".join(names[i:i + 2]) for i in range(0, min(len(names), 4), 2)]
+            if len(names) > 4:
+                lines.append(f"and {len(names) - 4} more")
+            lines += ["It starts over from rest,", "check those bones"]
+            draw_lines(box, "ERROR", *lines)
         pb = context.active_pose_bone
         if pb is None:
             row.label(text="Select a pose bone")
@@ -127,6 +153,10 @@ class EMILSWIGGLE_PT_main(EmilsWigglePanel, bpy.types.Panel):
         icon = "HIDE_ON" if pb.emils_wiggle.mute else "BONE_DATA"
         row.prop(pb.emils_wiggle, "mute", icon=icon, icon_only=True, invert_checkbox=True, emboss=False)
         row.label(text="Bone muted" if pb.emils_wiggle.mute else pb.name)
+        if rt_rig is not None and pb.name in rt_rig.blowup_bones:
+            draw_lines(layout, "ERROR", "This bone blew up", "see its warnings below")
+        if min(abs(v) for v in pb.scale) < 1e-6:
+            draw_lines(layout, "ERROR", "Bone scaled to 0", "it can't wiggle")
 
 
 class EMILSWIGGLE_PT_tail(EmilsWigglePanel, bpy.types.Panel):

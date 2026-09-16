@@ -88,6 +88,9 @@ class RigRuntime:
         self.bg_done = None  # cache_gen the background cache finished (or gave up) on
         self.bg_reason = ""
         self.fast_reason = ""
+        self.blowups = 0  # times the sim blew up and started over, for the panel
+        self.blowup_frame = None
+        self.blowup_bones = []
         self.pending = None
         self.pre_applied = set()
 
@@ -774,6 +777,8 @@ def settings_changed(scene, structure=False):
     rt = get(scene)
     for rig in rt.rigs.values():
         rig.settings_dirty = True
+        rig.blowups = 0
+        rig.blowup_bones = []
         invalidate(rig, scene=scene)
     if structure:
         rt.structure_dirty = True
@@ -1107,20 +1112,70 @@ def _finite_vec(v):
     return v is not None and all(math.isfinite(x) and abs(x) < MAX_POSITION for x in v)
 
 
+def _bone_blown(b):
+    """Non-finite values, or finite ones so big that Blender would turn them into inf
+    (a scale of 1e20 decomposes to an infinite float32 scale)."""
+    if not (_finite_vec(b.pos) and _finite_vec(b.vel) and _finite_vec(b.hpos) and _finite_vec(b.hvel)):
+        return True
+    d = b.delta
+    for i in range(3):
+        if not (math.isfinite(d[i][3]) and abs(d[i][3]) < MAX_POSITION):
+            return True
+        for j in range(3):
+            if not (math.isfinite(d[i][j]) and abs(d[i][j]) < MAX_DELTA_SCALE):
+                return True
+    return False
+
+
+def blown_bones(rig):
+    return [b.name for b in rig.bones if _bone_blown(b)]
+
+
 def _all_finite(rig):
-    """False when the sim blew up: non-finite values, or finite ones so big that Blender would
-    turn them into inf (a scale of 1e20 decomposes to an infinite float32 scale)."""
-    for b in rig.bones:
-        if not (_finite_vec(b.pos) and _finite_vec(b.vel) and _finite_vec(b.hpos) and _finite_vec(b.hvel)):
-            return False
-        d = b.delta
-        for i in range(3):
-            if not (math.isfinite(d[i][3]) and abs(d[i][3]) < MAX_POSITION):
-                return False
-            for j in range(3):
-                if not (math.isfinite(d[i][j]) and abs(d[i][j]) < MAX_DELTA_SCALE):
-                    return False
-    return True
+    return not any(_bone_blown(b) for b in rig.bones)
+
+
+def side_warnings(scene, side, head=False):
+    """(icon, title, detail) for settings of one bone end that make no sense or blow the sim up.
+
+    Two short lines each, the sidebar is narrow.
+
+    A tail that can't stretch stays at its length whatever pushes it, so strong forces only
+    pull it straight there. A head, or a tail that stretches, can get thrown off for real.
+    """
+    free = head or side.stretch > 0.0
+    out = []
+    s = scene.emils_wiggle
+    r = scene.render
+    dt = r.fps_base / r.fps / max(1, s.substeps)
+    if side.per_axis:
+        stiff, damp, gravity = max(side.stiff_axis), max(side.damp_axis), max(abs(v) for v in side.gravity_axis)
+    else:
+        stiff, damp, gravity = side.stiff, side.damp, abs(side.gravity)
+    colliding = ((side.collider_type == "Object" and side.collider is not None)
+                 or (side.collider_type == "Collection" and side.collider_collection is not None))
+    if colliding and side.bounce > 1.0:
+        out.append(("ERROR", "Bounce over 1", "adds energy, it'll blow up"))
+    if colliding and side.friction > 1.0:
+        out.append(("ERROR", "Friction over 1", "overshoots, it'll blow up"))
+    if scene.use_gravity and scene.gravity.length * gravity > 1000.0:
+        out.append(("ERROR", "Gravity this strong", "can throw the bone off") if free
+                   else ("INFO", "Gravity this strong", "just pulls the bone straight"))
+    wind = side.wind_ob
+    if wind is not None and wind.field is not None and wind.field.type == "WIND" \
+            and abs(wind.field.strength * side.wind) / side.mass > 1000.0:
+        out.append(("ERROR", "Wind this strong", "for this mass can throw it off") if free
+                   else ("INFO", "Wind this strong", "for this mass just pulls it straight"))
+    limit = s.iterations / (dt * dt)
+    if stiff > limit:
+        out.append(("INFO", f"Stiff over {limit:.0f}", "doesn't get any stiffer here"))
+    if damp * dt >= 1.0:
+        out.append(("INFO", f"Damp of {1.0 / dt:.0f} or more", "stops all motion"))
+    return out
+
+
+def zero_scale(matrix):
+    return min(abs(v) for v in matrix.to_scale()) < 1e-6
 
 
 def _converged(rig, snaps):
@@ -1250,9 +1305,13 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
                 rig.key = rt.new_key("skip")
                 rig.approx = True
 
-    if not _all_finite(rig):
+    bad = blown_bones(rig)
+    if bad:
         # extreme settings or a degenerate pose blew the sim up, never hand that to Blender
         rt.counts["unstable"] += 1
+        rig.blowups += 1
+        rig.blowup_frame = frame
+        rig.blowup_bones = bad
         solver.prepare_view(rig.bones, 1.0)
         solver.reset(rig.bones)
         if not _all_finite(rig):

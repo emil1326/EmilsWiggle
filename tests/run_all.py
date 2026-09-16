@@ -39,6 +39,7 @@ CONFIG_SCRIPT = """
 import os, sys, bpy
 p = bpy.context.preferences
 p.inputs.tablet_api = "WINDOWS_INK"
+p.view.show_splash = False
 p.use_preferences_save = False
 bpy.ops.wm.save_userpref()
 open(sys.argv[sys.argv.index("--") + 1], "w").write("ok")

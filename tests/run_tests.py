@@ -26,7 +26,7 @@ import faulthandler  # noqa: E402
 faulthandler.enable(_log)
 
 import bpy  # noqa: E402
-from mathutils import Vector  # noqa: E402
+from mathutils import Matrix, Vector  # noqa: E402
 
 import EmilsWiggle  # noqa: E402
 from EmilsWiggle import runtime  # noqa: E402
@@ -658,6 +658,14 @@ def test_ui_draw():
     s.head.collider_collection = scene.collection.children[0] if scene.collection.children else None
     play(scene, ob, range(1, 4))
     draw_all(ctx)
+    # everything that can warn at once
+    rig = runtime.get(scene).rigs["Rig"]
+    rig.blowups, rig.blowup_frame, rig.blowup_bones = 3, 2, ["w0", "w1", "w2", "a", "b", "c"]
+    s.tail.bounce, s.tail.stiff_axis = 4.0, (1e7, 1e7, 1e7)
+    pb.scale = (1.0, 0.0, 1.0)
+    draw_all(ctx)
+    pb.scale = (1.0, 1.0, 1.0)
+    s.tail.bounce = 0.5
     ob.emils_wiggle.mute = True
     draw_all(ctx)
     ob.emils_wiggle.mute = False
@@ -1367,6 +1375,73 @@ def test_dropped_frames():
           not rt.counts.get("RESET") and rt.counts.get("SIM", 0) == 4, f"{dict(rt.counts)}")
 
 
+def test_settings_warnings():
+    scene = fresh_scene()
+    scene.use_gravity = True
+    scene.render.fps = 24
+    ob = make_chain("Rig")
+    scene.emils_wiggle.enabled = True
+    enable(ob)
+    tail = ob.pose.bones["w2"].emils_wiggle.tail
+
+    def found():
+        return [(icon, f"{title} {detail}") for icon, title, detail in runtime.side_warnings(scene, tail)]
+
+    def texts():
+        return [t for _icon, t in found()]
+    check("sane settings have no warnings", texts() == [], f"{texts()}")
+
+    tail.gravity = 1e30
+    check("on a tail that can't stretch that's only a note",
+          [i for i, t in found() if "Gravity" in t] == ["INFO"])
+    tail.stretch = 1.0
+    check("a stretchy one gets a real warning",
+          [i for i, t in found() if "Gravity" in t] == ["ERROR"])
+    play(scene, ob, range(1, 5))
+    rig = runtime.get(scene).rigs["Rig"]
+    check("a gravity like that blows the sim up and the rig remembers which bone",
+          rig.blowups > 0 and "w2" in rig.blowup_bones and rig.blowup_frame is not None,
+          f"{rig.blowups} {rig.blowup_bones} {rig.blowup_frame}")
+    check("and that bone's settings say why", any("Gravity" in t for t in texts()), f"{texts()}")
+    tail.gravity = 1.0
+    check("changing a setting clears the alert", rig.blowups == 0 and not rig.blowup_bones)
+    tail.stretch = 0.0
+
+    plane = _plane("Wall", 1.0, 0.0)
+    tail.collider_type = "Object"
+    tail.collider = plane
+    tail.bounce, tail.friction = 3.0, 2.0
+    hits = texts()
+    check("bounce and friction over 1 get flagged when colliding",
+          any("Bounce" in t for t in hits) and any("Friction" in t for t in hits), f"{hits}")
+    tail.collider = None
+    check("but not without a collider", not any("Bounce" in t for t in texts()))
+    tail.bounce, tail.friction = 0.5, 0.5
+
+    wind = bpy.data.objects.new("Gust", None)
+    scene.collection.objects.link(wind)
+    with bpy.context.temp_override(active_object=wind, object=wind):
+        bpy.ops.object.forcefield_toggle()
+    wind.field.type = "WIND"
+    wind.field.strength = 500.0
+    tail.wind_ob = wind
+    tail.wind, tail.mass = 1.0, 0.01
+    check("strong wind on a light end gets flagged", any("Wind" in t for t in texts()), f"{texts()}")
+    tail.wind_ob = None
+    tail.mass = 1.0
+
+    tail.stiff, tail.damp = 1e6, 1000.0
+    notes = found()
+    check("stiffness and damping past what they can do get an info note",
+          [i for i, t in notes if "Stiff" in t] == ["INFO"] and [i for i, t in notes if "Damp" in t] == ["INFO"],
+          f"{notes}")
+    tail.per_axis = True
+    tail.stiff_axis = (1.0, 1.0, 1e6)
+    check("per axis values are checked too", any("Stiff" in t for t in texts()))
+    check("a zero scale is spotted", runtime.zero_scale(Matrix.Diagonal((1.0, 0.0, 1.0, 1.0)))
+          and not runtime.zero_scale(ob.matrix_world))
+
+
 def test_huge_values():
     from mathutils import Matrix
     scene = fresh_scene()
@@ -1512,6 +1587,7 @@ def main():
     run(test_background_cache)
     run(test_dropped_frames)
     run(test_huge_values)
+    run(test_settings_warnings)
     from EmilsWiggle import handlers
     check("no errors inside the handlers during the whole run (empty-mesh collider included)",
           handlers.error_count == 0, f"{handlers.error_count} errors, see the log")

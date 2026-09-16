@@ -11,6 +11,7 @@ Background caching, and slow playback that doesn't fall apart.
 - The panel says why Fast Preview can't be used on a rig, and the Debug panel shows the real playback fps (the physics time never changed with Fast Preview, that's normal) and why the cache got cleared.
 - Changing the frame rate or the gravity clears the cache now.
 - Deleting some unrelated object doesn't clear the cache anymore (Blender marks every collection as changed when an object goes away).
+- Warnings right in the bone settings when values don't make sense: Bounce or Friction over 1 with a collider, gravity or wind way too strong for the bone, a zero scale, and a note when Stiff or Damp are past the point where they change anything (at the scene's frame rate, substeps and quality). When the sim does blow up and start over, the main panel says so, with the frame and which bones.
 - Really extreme settings could blow a wiggle offset up so much that Blender turned it into an infinite scale on the empty. That counts as blown up now (the sim resets), and the empties never get inf or nan values no matter what.
 - Saving could crash Blender when the file had library overrides and Wiggle 2 had been turned off during the session (its leftover properties point at freed memory). The stress test found it, and those leftovers are now removed before every save, after loading a file and when Emil's Wiggle starts, on top of the cleanup that already happened.
 

@@ -160,7 +160,8 @@ def build_report(context):
     else:
         counts = ", ".join(f"{k} {v}" for k, v in sorted(rt.counts.items())) or "none"
         lines.append(f"counters: {counts}")
-        lines.append(f"last step {rt.stats_sim_ms:.2f} ms, handler errors {handlers.error_count}")
+        lines.append(f"last step {rt.stats_sim_ms:.2f} ms, handler errors {handlers.error_count},"
+                     f" setup pending {_yes(rt.needs_edit)}")
         lines.append("rigs:")
         for rig in rt.rigs.values():
             tails = sum(b.has_tail for b in rig.bones)

@@ -239,6 +239,86 @@ def steps():
     check("and it didn't create anything from the render thread",
           sum(1 for o in bpy.data.objects if runtime.HELPER_TAG in o) == 3)
 
+    # --- New Scene > Full Copy: the window switches to a scene whose depsgraph was built but never
+    # evaluated, then the frame handlers run. The copied rig needs its own empties, and making them
+    # in frame_change_pre crashed Blender 3.6 in the depsgraph rebuild right after.
+    win = bpy.context.window_manager.windows[0]
+    src = win.scene
+    for f in (1, 2, 3):
+        src.frame_set(f)
+    yield 0.3
+    before = helpers()
+    src_mat = helper_mat("w2")
+    with bpy.context.temp_override(**ctx()):
+        bpy.ops.scene.new(type="FULL_COPY")
+    yield 0.5
+    copy = win.scene
+    check("full scene copy doesn't crash", copy != src and copy.emils_wiggle.enabled)
+    copy.frame_set(copy.frame_current + 1)
+    yield 0.3
+    rig_copy = next(o for o in copy.objects if o.type == "ARMATURE")
+    c = runtime.find_constraint(rig_copy.pose.bones["w2"])
+    check("the copied rig got its own empties", c is not None and c.target is not None
+          and c.target.name not in before, f"{c.target.name if c and c.target else None}")
+    check("and it never moved the original rig's empties", mdiff(helper_mat("w2"), src_mat) < 1e-6)
+
+    # --- same thing when switching to a scene that was never shown
+    other = bpy.data.scenes.new("Unseen")
+    other.frame_start, other.frame_end = 1, 24
+    rig2 = rig_copy.copy()  # its constraints still point at the copy's empties
+    rig2.data = rig_copy.data.copy()
+    rig2.parent = None
+    other.collection.objects.link(rig2)
+    other.emils_wiggle["enabled"] = True  # no update callback, so nothing gets set up yet
+    taken = helpers()
+    win.scene = other
+    yield 0.5
+    other.frame_set(2)
+    yield 0.3
+    c2 = runtime.find_constraint(rig2.pose.bones["w2"])
+    check("switching to a never shown scene sets its rigs up without crashing",
+          c2 is not None and c2.target is not None and c2.target.name not in taken,
+          f"{c2.target.name if c2 and c2.target else None}")
+
+    # --- Alembic export as a background job runs the frame handlers on its own thread
+    win.scene = src
+    yield 0.3
+    rig_src = bpy.data.objects["Rig"]
+    rig_src.pose.bones["root"].emils_wiggle["use_tail"] = True  # needs a new empty, no update callback
+    runtime.clear_all()
+    count = len(helpers())
+    threads = []
+
+    def thread_spy(sc, *args):
+        # runs after our frame_change_post, so a helper made there would already be counted
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            threads.append((sc.frame_current, len(helpers())))
+    bpy.app.handlers.frame_change_post.append(thread_spy)
+    errors = handlers.error_count
+    with bpy.context.temp_override(**ctx()):
+        bpy.ops.wm.alembic_export(filepath=os.path.join(OUT, "rig.abc"), start=1, end=6,
+                                  as_background_job=True)
+    yield 0.5
+    t0 = time.time()
+    while bpy.context.window_manager.is_interface_locked and time.time() - t0 < 60:
+        yield 0.25
+    bpy.app.handlers.frame_change_post.remove(thread_spy)
+    check("alembic export runs our handlers off the main thread", [f for f, _n in threads][:6] == [1, 2, 3, 4, 5, 6],
+          f"{threads}")
+    check("and nothing gets created from that thread",
+          all(n == count for _f, n in threads) and handlers.error_count == errors,
+          f"{count}: {threads}, errors {handlers.error_count - errors}")
+    check("the file got written", os.path.exists(os.path.join(OUT, "rig.abc")))
+    src.frame_set(3)
+    yield 0.3
+    check("the next frame on the main thread sets the new bone up", len(helpers()) == count + 1,
+          f"{count} -> {len(helpers())}")
+
+
+def helpers():
+    return {o.name for o in bpy.data.objects if runtime.HELPER_TAG in o}
+
 
 _gen = steps()
 

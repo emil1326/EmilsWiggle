@@ -5,8 +5,13 @@ Wiggle 2's unregister() removes its PropertyGroup classes but leaves the
 Scene/Object/PoseBone "wiggle" pointer properties behind. Disable Wiggle 2 while
 Blender runs and those properties point at freed types: anything that walks them
 later (resolving a property path for the Info log, for example) can crash Blender.
-A slow timer watches for that and removes the leftovers.
+
+Wiggle 2's unregister() gets wrapped so the leftovers go away in the same call,
+before Blender draws anything. A slow timer is the backup (and wraps a Wiggle 2
+that gets enabled or reloaded later).
 """
+
+import sys
 
 import bpy
 
@@ -15,6 +20,7 @@ WIGGLE2_POINTERS = (
     ("Object", "wiggle", "WiggleObject"),
     ("PoseBone", "wiggle", "WiggleBone"),
 )
+WIGGLE2_NAME = "Wiggle 2"
 CHECK_EVERY = 1.0
 
 
@@ -38,15 +44,58 @@ def clean_dangling_wiggle2():
     return removed
 
 
+def _wiggle2_modules():
+    for mod in list(sys.modules.values()):
+        try:
+            names = vars(mod)  # not getattr: some modules import things lazily on attribute access
+        except TypeError:
+            continue
+        info = names.get("bl_info")
+        if isinstance(info, dict) and info.get("name") == WIGGLE2_NAME and callable(names.get("unregister")):
+            yield mod
+
+
+def hook_wiggle2():
+    """Wrap Wiggle 2's unregister() so it cleans up after itself."""
+    for mod in _wiggle2_modules():
+        original = mod.unregister
+        if getattr(original, "emils_wiggle_original", None) is not None:
+            continue
+
+        def unregister(_original=original):
+            try:
+                _original()
+            finally:
+                try:
+                    clean_dangling_wiggle2()
+                except Exception:
+                    pass
+
+        unregister.emils_wiggle_original = original
+        mod.unregister = unregister
+
+
+def unhook_wiggle2():
+    for mod in _wiggle2_modules():
+        original = getattr(mod.unregister, "emils_wiggle_original", None)
+        if original is not None:
+            mod.unregister = original
+
+
 def _watch():
     try:
         clean_dangling_wiggle2()
+        hook_wiggle2()
     except Exception:
         pass
     return CHECK_EVERY
 
 
 def register():
+    try:
+        hook_wiggle2()
+    except Exception:
+        pass
     if not bpy.app.timers.is_registered(_watch):
         bpy.app.timers.register(_watch, first_interval=CHECK_EVERY, persistent=True)
 
@@ -54,3 +103,7 @@ def register():
 def unregister():
     if bpy.app.timers.is_registered(_watch):
         bpy.app.timers.unregister(_watch)
+    try:
+        unhook_wiggle2()
+    except Exception:
+        pass

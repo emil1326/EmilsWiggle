@@ -5,6 +5,8 @@ Run every Emil's Wiggle test suite on Blender 3.6 and print a summary.
     python tests/run_all.py --headless      # just the background suite
     python tests/run_all.py --gui           # just the GUI suite (opens a window)
     python tests/run_all.py --blender PATH  # pick the Blender to use
+    python tests/run_all.py --stress        # random-action stress runs instead (tests/stress.py)
+    python tests/run_all.py --stress --seeds 5 --ops 500
 
 Plain Python, no bpy needed. Exit code is 0 when everything passed.
 Blender is found through --blender, the BLENDER_36 environment variable, the
@@ -22,10 +24,13 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+GUI_ARGS = ["--no-window-focus", "--window-geometry", "0", "0", "900", "700"]
 SUITES = {
     "headless": ("run_tests.py", ["-b", "--factory-startup"], 600),
-    # no --factory-startup: the GUI suite gets its own config folder (see gui_config)
-    "gui": ("run_gui_tests.py", ["--no-window-focus", "--window-geometry", "0", "0", "900", "700"], 300),
+    # no --factory-startup for GUI runs: they get their own config folder (see gui_config)
+    "gui": ("run_gui_tests.py", GUI_ARGS, 300),
+    "stress": ("stress.py", ["-b", "--factory-startup"], 1200),
+    "stress-gui": ("stress.py", GUI_ARGS, 1200),
 }
 
 # Makes the throwaway preferences the GUI suite runs with. The tablet API is Windows Ink
@@ -117,15 +122,17 @@ def gui_config(blender, out_dir):
     raise RuntimeError(f"couldn't make the GUI test config: {status}")
 
 
-def run_suite(blender, name, out_dir):
+def run_suite(blender, name, out_dir, script_args=(), label=None):
     script, args, timeout = SUITES[name]
-    result = os.path.join(out_dir, f"{name}.txt")
+    label = label or name
+    result = os.path.join(out_dir, f"{label}.txt")
     log = result + ".log"
     env = None
-    if name == "gui":
+    if "-b" not in args:
         env = dict(os.environ, BLENDER_USER_CONFIG=gui_config(blender, out_dir))
     started = time.time()
-    status = run_blender(blender, [*args, "--python", os.path.join(HERE, script), "--", result], result, timeout, env)
+    cmd = [*args, "--python", os.path.join(HERE, script), "--", result, *map(str, script_args)]
+    status = run_blender(blender, cmd, result, timeout, env)
     elapsed = time.time() - started
 
     lines = []
@@ -137,7 +144,7 @@ def run_suite(blender, name, out_dir):
     errors = [ln for ln in lines if ln.startswith("handler errors:") and ln.strip() != "handler errors: 0"]
     ok = status == "done" and not fails and not errors and passes
     return {
-        "name": name, "ok": bool(ok), "status": status, "passes": len(passes), "fails": fails + errors,
+        "name": label, "ok": bool(ok), "status": status, "passes": len(passes), "fails": fails + errors,
         "lines": lines, "log": log, "elapsed": elapsed,
     }
 
@@ -156,6 +163,10 @@ def main():
     parser.add_argument("--gui", action="store_true", help="only the GUI suite")
     parser.add_argument("--out", help="folder for results and logs (default: a temp folder)")
     parser.add_argument("-v", "--verbose", action="store_true", help="print every test line")
+    parser.add_argument("--stress", action="store_true", help="run the random stress test instead")
+    parser.add_argument("--seeds", type=int, default=3, help="stress: how many seeds (default 3)")
+    parser.add_argument("--first-seed", type=int, default=1, help="stress: first seed (default 1)")
+    parser.add_argument("--ops", type=int, default=300, help="stress: actions per run (default 300)")
     opts = parser.parse_args()
 
     blender = find_blender(opts.blender)
@@ -163,20 +174,28 @@ def main():
         print("Couldn't find Blender 3.6, pass --blender or set BLENDER_36")
         return 2
     names = [n for n, on in (("headless", opts.headless), ("gui", opts.gui)) if on] or ["headless", "gui"]
+    runs = [(n, (), n) for n in names]
+    if opts.stress:
+        runs = []
+        seeds = range(opts.first_seed, opts.first_seed + opts.seeds)
+        if not opts.gui:
+            runs += [("stress", (seed, opts.ops), f"stress-seed{seed}") for seed in seeds]
+        if not opts.headless:
+            runs += [("stress-gui", (seed, opts.ops), f"stress-gui-seed{seed}") for seed in seeds]
     out_dir = opts.out or tempfile.mkdtemp(prefix="emils_wiggle_tests_")
     os.makedirs(out_dir, exist_ok=True)
     print(f"Blender: {blender}\nResults: {out_dir}")
 
     all_ok = True
-    for name in names:
-        print(f"\n== {name} ...", flush=True)
-        res = run_suite(blender, name, out_dir)
+    for name, script_args, label in runs:
+        print(f"\n== {label} ...", flush=True)
+        res = run_suite(blender, name, out_dir, script_args, label)
         all_ok &= res["ok"]
         for ln in res["lines"]:
             if opts.verbose or not ln.startswith("PASS"):
                 print("  " + ln)
         verdict = "OK" if res["ok"] else "FAILED"
-        print(f"== {name}: {verdict}, {res['passes']} passed, {len(res['fails'])} failed"
+        print(f"== {label}: {verdict}, {res['passes']} passed, {len(res['fails'])} failed"
               f" ({res['elapsed']:.0f}s){'' if res['status'] == 'done' else ', ' + res['status']}")
         if not res["ok"]:
             print(f"-- last lines of {res['log']}:\n{tail(res['log'])}")

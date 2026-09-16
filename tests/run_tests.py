@@ -849,6 +849,35 @@ def test_caches_and_updates():
     check("Wiggle 2's dangling properties get removed", removed == ["Scene.wiggle"]
           and "wiggle" not in Scene.bl_rna.properties and scene.get("wiggle") is not None, f"{removed}")
 
+    # a fake Wiggle 2 add-on: turning it off cleans up right away, no waiting on the timer
+    import types
+
+    class WiggleObject(bpy.types.PropertyGroup):
+        mute: bpy.props.BoolProperty()
+
+    def fake_register():
+        bpy.utils.register_class(WiggleObject)
+        bpy.types.Object.wiggle = bpy.props.PointerProperty(type=WiggleObject)
+
+    def fake_unregister():
+        bpy.utils.unregister_class(WiggleObject)
+
+    fake = types.ModuleType("fake_wiggle_2")
+    fake.bl_info = {"name": "Wiggle 2"}
+    fake.register, fake.unregister = fake_register, fake_unregister
+    sys.modules["fake_wiggle_2"] = fake
+    try:
+        fake.register()
+        legacy.hook_wiggle2()
+        legacy.hook_wiggle2()  # twice doesn't wrap twice
+        fake.unregister()
+        check("turning Wiggle 2 off removes its leftovers in the same call",
+              "wiggle" not in bpy.types.Object.bl_rna.properties)
+        legacy.unhook_wiggle2()
+        check("and the hook comes off again", fake.unregister is fake_unregister)
+    finally:
+        del sys.modules["fake_wiggle_2"]
+
 
 def test_render_details():
     scene = fresh_scene()
@@ -1011,6 +1040,136 @@ def test_fast_preview_and_loop():
     check("render ignores fast preview", worst < 1e-4, f"{worst:.2e}")
 
 
+def test_threads_and_deferred_setup():
+    import threading
+    scene = fresh_scene()
+    ob = make_chain("Rig")
+    scene.emils_wiggle.enabled = True
+    enable(ob)
+    play(scene, ob, range(1, 4))
+    rt = runtime.get(scene)
+    seen = []
+    t = threading.Thread(target=lambda: seen.append(runtime._can_edit_data(rt)))
+    t.start()
+    t.join()
+    check("other threads (exports, compositor scenes) never create or delete anything",
+          seen == [False] and runtime._can_edit_data(rt), f"{seen}")
+
+    # a copied rig still points at the original's empties
+    copy = ob.copy()
+    copy.data = ob.data.copy()
+    scene.collection.objects.link(copy)
+    orig = set(_helper_ptrs(ob).values())
+    probe = runtime.SceneRuntime()
+    runtime.rebuild(scene, probe, edit=False)
+    got = {b.helper.as_pointer() for b in probe.rigs[copy.name].bones if b.helper is not None}
+    check("a read-only setup never hands a copy the original's empties", not got and probe.needs_edit,
+          f"{len(got)} borrowed")
+    check("and it didn't create anything", sum(1 for o in bpy.data.objects if runtime.HELPER_TAG in o) == 3)
+
+    # the depsgraph update notices the new rig and a timer sets it up, no frame change needed
+    bpy.context.evaluated_depsgraph_get()
+    check("the new rig asks for its setup", rt.needs_edit and bpy.app.timers.is_registered(runtime._apply_edits))
+    runtime._apply_edits()  # background Blender doesn't run timers by itself
+    ptrs = _helper_ptrs(copy)
+    check("the timer gives the copy its own empties",
+          len(ptrs) == 3 and not set(ptrs.values()) & orig and not rt.needs_edit, f"{len(ptrs)}")
+    play(scene, copy, range(4, 8))
+    check("both rigs simulate", set(rt.rigs) == {"Rig", copy.name} and rt.counts.get("errors", 0) == 0,
+          f"{set(rt.rigs)}")
+
+    # a very long timeline keeps the cache inside its budget
+    old = runtime.CACHE_BUDGET
+    try:
+        runtime.CACHE_BUDGET = 60  # 2 rigs x 3 bones: about 10 frames
+        runtime.reset_scene(scene)
+        play(scene, ob, range(1, 41))
+        count, lo, hi = runtime.cache_info(scene)
+        check("the cache drops far frames once it's full", count <= 10 and hi == 40, f"{count} ({lo}-{hi})")
+        scene.frame_set(5)  # dropped, starts over there
+        scene.frame_set(6)
+        check("and a dropped frame just simulates again", rt.counts.get("errors", 0) == 0)
+    finally:
+        runtime.CACHE_BUDGET = old
+
+
+def test_linked_and_overridden_rigs():
+    scene = fresh_scene()
+    ob = make_chain("Rig")
+    scene.emils_wiggle.enabled = True
+    enable(ob)
+    play(scene, ob, range(1, 4))
+    path = os.path.join(tempfile.mkdtemp(), "lib.blend")
+    bpy.ops.wm.save_as_mainfile(filepath=path, copy=True)
+    scene = fresh_scene()
+    # a local object that happens to have the same name as one of the linked empties
+    clash = bpy.data.objects.new("EmilsWiggle_Rig_w0", None)
+    runtime.helper_collection().objects.link(clash)
+    scene.emils_wiggle.enabled = True
+    rt = runtime.get(scene)
+    with bpy.data.libraries.load(path, link=True) as (_src, dst):
+        dst.objects = ["Rig"]
+    linked = dst.objects[0]
+    scene.collection.objects.link(linked)
+    play(scene, linked, range(1, 3))
+    check("a linked rig without an override is left alone", not rt.rigs and rt.counts.get("errors", 0) == 0,
+          f"{set(rt.rigs)} {dict(rt.counts)}")
+    over = linked.override_create(remap_local_usages=True)
+    moved = play(scene, over, range(1, 12))
+    for mute in (True, False):  # the rig gets set up again each time
+        over.pose.bones["w1"].emils_wiggle.mute = mute
+        moved.update(play(scene, over, range(12, 16)))
+    check("an overridden rig wiggles, even when a linked empty's name is taken locally",
+          over.name in rt.rigs and rt.counts.get("errors", 0) == 0,
+          f"{set(rt.rigs)} errors {rt.counts.get('errors', 0)}: {runtime.last_error.strip()[-150:]}")
+    check("the local look-alike is still there", bpy.data.objects.get("EmilsWiggle_Rig_w0") is not None)
+
+
+def _preroll_steps(rig_name):
+    """(done, total) from the last "preroll x/y steps" history note of a rig."""
+    for _f, name, what in reversed(runtime.history):
+        if name == rig_name and "preroll " in what:
+            done, total = what.split("preroll ")[1].split(" ")[0].split("/")
+            return int(done), int(total)
+    return None
+
+
+def test_preroll():
+    from EmilsWiggle import solver
+    out = {}
+    cases = (
+        ("none", 0, None, 50.0, 10.0),
+        ("early", 400, None, 50.0, 10.0),
+        ("full", 400, 10 ** 9, 50.0, 10.0),  # a window that never ends = the old full preroll
+        ("swing", 400, None, 0.0, 0.0),  # no spring, no damping: it never stops moving
+    )
+    try:
+        for label, preroll, window, stiff, damp in cases:
+            scene = fresh_scene()
+            scene.use_gravity = True
+            scene.gravity = (6.0, 0.0, -9.81)
+            s = scene.emils_wiggle
+            s.preroll, s.substeps = preroll, 2
+            ob = make_chain("Rig", root_motion=((1, 0.0),))
+            s.enabled = True
+            enable(ob, stiff=stiff, damp=damp, gravity=1.0)
+            solver.SETTLE_WINDOW = window or 10
+            scene.frame_set(1)
+            out[label] = (tail_world(ob).copy(), _preroll_steps("Rig"))
+    finally:
+        solver.SETTLE_WINDOW = 10
+        bpy.context.scene.gravity = (0.0, 0.0, -9.81)
+    sag = (out["early"][0] - out["none"][0]).length
+    check("preroll lets the chain settle before the first frame", sag > 0.05, f"moved {sag:.3f}")
+    steps = out["early"][1]
+    check("preroll stops once nothing moves", steps is not None and steps[0] < steps[1], f"{steps}")
+    same = (out["early"][0] - out["full"][0]).length
+    check("stopping the preroll early gives the same pose", same < 1e-3,
+          f"diff {same:.2e}, full {out['full'][1]}")
+    check("a chain that keeps swinging gets the whole preroll", out["swing"][1] == (800, 800),
+          f"{out['swing'][1]}")
+
+
 def test_perf():
     out = {}
     for label in ("off", "muted", "on", "fast", "cached"):
@@ -1078,6 +1237,9 @@ def main():
     run(test_scene_copies)
     run(test_caches_and_updates)
     run(test_render_details)
+    run(test_preroll)
+    run(test_threads_and_deferred_setup)
+    run(test_linked_and_overridden_rigs)
     from EmilsWiggle import handlers
     check("no errors inside the handlers during the whole run (empty-mesh collider included)",
           handlers.error_count == 0, f"{handlers.error_count} errors, see the log")

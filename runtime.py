@@ -22,9 +22,19 @@ How a frame goes (see README for the diagram):
 
 Only the scene/depsgraph given to the handlers are used, never bpy.context, so the
 same code runs during F12 / Ctrl+F12 renders on the render thread. Nothing gets
-created or deleted from that thread.
+created or deleted from that thread (or any other one: Alembic/USD exports and
+compositor scenes call the frame handlers from their own threads too).
+
+frame_change_pre never creates or deletes anything either, it only picks up the
+empties that already exist. When Blender switches a window to another scene it
+builds that scene's depsgraph, runs frame_change_pre, then builds it again without
+evaluating in between, and 3.6 crashes in that second build if the handler added
+objects or constraints. Setting up empties/constraints happens in frame_change_post
+(after the evaluation) or in a timer on the main thread instead, see request_edits().
 """
 
+import math
+import threading
 import time
 import traceback
 from collections import Counter, deque
@@ -38,6 +48,7 @@ CONSTRAINT_NAME = "Emil's Wiggle"
 HELPER_TAG = "emils_wiggle_helper"
 HELPER_COLLECTION = "EmilsWiggle Helpers"
 MAX_SKIP = 4
+CACHE_BUDGET = 250_000  # cached bone-frames per scene (about 1.4 KB each), far frames go first
 PIN_TYPES = {"DAMPED_TRACK", "TRACK_TO", "LOCKED_TRACK"}
 IDENTITY = Matrix.Identity(4)
 DELTA = 13  # index of the wiggle offset in a solver snapshot
@@ -45,6 +56,7 @@ DELTA = 13  # index of the wiggle offset in a solver snapshot
 CACHE, SIM, RESET, SAME, SUB = "CACHE", "SIM", "RESET", "SAME", "SUB"
 
 _runtimes = {}
+_MAIN_THREAD = threading.main_thread()
 history = deque(maxlen=60)  # (frame, rig, what happened), for the debug report
 last_error = ""
 
@@ -83,6 +95,7 @@ class SceneRuntime:
         self.skip_static_preroll = False
         self.force_fast = False
         self.rendering = False
+        self.needs_edit = False  # a read-only rebuild left empties/constraints to set up
         self.legacy_found = False
         self.stats_sim_ms = 0.0
         self.counts = Counter()
@@ -125,9 +138,13 @@ def _close(a, b, eps=1e-6):
     return True
 
 
+def _on_main_thread():
+    return threading.current_thread() is _MAIN_THREAD
+
+
 def _can_edit_data(rt):
     # Renders from the UI run on their own thread. Background renders are on the main one.
-    return not rt.rendering or bpy.app.background
+    return _on_main_thread() and (not rt.rendering or bpy.app.background)
 
 
 # ---------------------------------------------------------------- helper empties
@@ -182,7 +199,8 @@ def ensure_helper(ob, pb, taken):
     if helper.rotation_mode != "QUATERNION":
         helper.rotation_mode = "QUATERNION"
     coll = helper_collection()
-    if coll.objects.get(helper.name) != helper:
+    if coll not in helper.users_collection:
+        # (not by name: an empty linked from a library can share its name with a local object)
         coll.objects.link(helper)
     if c is None:
         c = pb.constraints.new("COPY_TRANSFORMS")
@@ -209,10 +227,15 @@ def ensure_helper(ob, pb, taken):
     return helper
 
 
-def existing_helper(pb):
-    """Read-only version for the render thread: whatever empty the constraint already uses."""
+def existing_helper(ob, pb, taken):
+    """Read-only version of ensure_helper: the bone's empty if it already has its own, else None."""
     c = find_constraint(pb)
-    return c.target if c is not None and _is_helper(c.target) else None
+    helper = c.target if c is not None else None
+    if (helper is None or not _is_helper(helper) or helper.get(HELPER_TAG) != _owner_key(ob, pb)
+            or helper.as_pointer() in taken):
+        return None  # a copied rig still points at the original's empty, never move that one
+    taken.add(helper.as_pointer())
+    return helper
 
 
 def remove_constraint(pb):
@@ -402,20 +425,30 @@ def _build_rig(ob, signature):
 
 
 def _attach(ob, rig, taken, edit):
+    """Give the rig's bones their empties. Returns True when an empty may have lost its bone."""
+    dropped = False
     for pb in ob.pose.bones:
         b = rig.by_name.get(pb.name)
         if b is None:
             if edit:
-                remove_constraint(pb)
+                dropped |= remove_constraint(pb)
             continue
-        helper = ensure_helper(ob, pb, taken) if edit else existing_helper(pb)
+        if edit:
+            c = find_constraint(pb)
+            old = _ptr(c.target) if c is not None else None
+            helper = ensure_helper(ob, pb, taken)
+            dropped |= old is not None and old != _ptr(helper)  # renamed/copied bone got a new one
+        else:
+            helper = existing_helper(ob, pb, taken)
         if _ptr(b.helper) != _ptr(helper):
             b.helper = helper
             b.shown = None
+    return dropped
 
 
 def rebuild(scene, rt, edit=True):
-    """Match the runtime to the scene. With edit=False nothing is created or deleted."""
+    """Match the runtime to the scene. With edit=False nothing is created or deleted,
+    and the edits it would have made are left for later (rt.needs_edit)."""
     old_rigs = rt.rigs
     new_rigs = {}
     taken = set()
@@ -436,7 +469,7 @@ def rebuild(scene, rt, edit=True):
                 if edit and rig is not None:
                     removed_something = True  # bones may have left the rig
                 rig = _build_rig(ob, signature)
-            _attach(ob, rig, taken, edit)
+            removed_something |= _attach(ob, rig, taken, edit)
             rig.settings_dirty = True  # colliders, winds, constraints may have changed too
             new_rigs[ob.name] = rig
         except Exception:
@@ -451,6 +484,51 @@ def rebuild(scene, rt, edit=True):
     rt.rigs = new_rigs
     rt.structure_dirty = False
     rt.object_count = len(scene.objects)
+    rt.needs_edit = not edit
+    if not edit:
+        request_edits()
+
+
+def _edit_now(scene, rt):
+    global last_error
+    try:
+        rebuild(scene, rt, edit=True)
+    except Exception:
+        rt.needs_edit = False  # don't retry a broken setup every frame
+        rt.counts["errors"] += 1
+        last_error = traceback.format_exc()
+        print("Emil's Wiggle: setting up the rigs failed")
+        traceback.print_exc()
+
+
+def _apply_edits():
+    """Timer: do the edits read-only rebuilds left behind, once it's safe."""
+    try:
+        wm = getattr(bpy.context, "window_manager", None)
+        busy = bpy.app.is_job_running("RENDER") or (wm is not None and wm.is_interface_locked)
+        again = False
+        for scene in bpy.data.scenes:
+            rt = peek(scene)
+            if rt is None or not rt.needs_edit:
+                continue
+            if busy:
+                again = True
+                continue
+            rt.rendering = False  # no render job is running
+            _edit_now(scene, rt)  # on a disabled scene this takes our constraints off
+            if not scene.emils_wiggle.enabled:
+                _runtimes.pop(scene.as_pointer(), None)
+        return 0.25 if again else None
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+def request_edits():
+    """Ask for the pending edits to happen on the main thread soon. Only callable from there."""
+    if not _on_main_thread() or bpy.app.timers.is_registered(_apply_edits):
+        return
+    bpy.app.timers.register(_apply_edits, first_interval=0.0)
 
 
 def _check_fast(rig, ob):
@@ -597,14 +675,31 @@ def frame_is_cached(scene, frame):
     return all(frame in rig.cache for rig in rt.rigs.values())
 
 
-def _store(rig, frame, s):
+def _store(rig, frame, s, rt=None):
     if s.cache_locked and frame in rig.cache:
         return
     entry = (rig.key, {b.name: solver.snapshot(b) for b in rig.bones})
     if not s.use_cache:
         # keep the frame before too, motion blur needs its neighbours
         rig.cache = {f: e for f, e in rig.cache.items() if f == frame - 1}
+    new = frame not in rig.cache
     rig.cache[frame] = entry
+    if new and rt is not None:
+        _trim_cache(rt, rig, frame)
+
+
+def _trim_cache(rt, rig, frame):
+    """A very long timeline shouldn't eat all the memory: drop the frames furthest away."""
+    total = sum(len(r.cache) * max(1, len(r.bones)) for r in rt.rigs.values())
+    if total <= CACHE_BUDGET:
+        return
+    per = max(1, len(rig.bones))
+    drop = min(len(rig.cache) - 1, -(-(total - int(CACHE_BUDGET * 0.9)) // per))
+    if drop <= 0:
+        return
+    for f in sorted(rig.cache, key=lambda f: abs(f - frame), reverse=True)[:drop]:
+        del rig.cache[f]
+    rt.counts["cache trimmed"] += drop
 
 
 # ---------------------------------------------------------------- callbacks from props/ops
@@ -617,14 +712,15 @@ def settings_changed(scene, structure=False):
     if structure:
         rt.structure_dirty = True
         if scene.emils_wiggle.enabled:
-            rebuild(scene, rt)
+            rebuild(scene, rt, edit=_can_edit_data(rt))
 
 
 def scene_enable_changed(scene):
     rt = get(scene)
-    rebuild(scene, rt)
-    if not scene.emils_wiggle.enabled:
-        _runtimes.pop(scene.as_pointer(), None)
+    edit = _can_edit_data(rt)
+    rebuild(scene, rt, edit)
+    if not scene.emils_wiggle.enabled and edit:
+        _runtimes.pop(scene.as_pointer(), None)  # otherwise the timer strips the bones first
 
 
 def reset_scene(scene):
@@ -632,7 +728,7 @@ def reset_scene(scene):
     rt = get(scene)
     rt.rigs = {}
     scene.emils_wiggle.cache_locked = False
-    rebuild(scene, rt)
+    rebuild(scene, rt, edit=_can_edit_data(rt))
     writer = HelperWriter()
     for rig in rt.rigs.values():
         for b in rig.bones:
@@ -705,19 +801,23 @@ def _subframe_delta(rig, b, frame, t):
     return d0 if d0 is not None else b.delta
 
 
-def _validate(scene, rt, edit):
-    if rt.structure_dirty or rt.object_count != len(scene.objects):
-        rebuild(scene, rt, edit)
-        return
+def _stale(scene, rt):
+    """Objects added/removed, or a rig or one of its bones renamed/deleted."""
+    if rt.object_count != len(scene.objects):
+        return True
     for rig in rt.rigs.values():
         ob = scene.objects.get(rig.name)
         if ob is None or ob.as_pointer() != rig.ptr or ob.pose is None:
-            rebuild(scene, rt, edit)
-            return
+            return True
         bones = ob.pose.bones
         if any(bones.get(b.name) is None for b in rig.bones):
-            rebuild(scene, rt, edit)  # a bone got renamed or deleted
-            return
+            return True
+    return False
+
+
+def _validate(scene, rt, edit):
+    if rt.structure_dirty or _stale(scene, rt):
+        rebuild(scene, rt, edit)
 
 
 def frame_pre(scene):
@@ -726,14 +826,15 @@ def frame_pre(scene):
         return
     rt = get(scene)
     rt.own_writes = set()
-    _validate(scene, rt, edit=_can_edit_data(rt))
+    _validate(scene, rt, edit=False)  # creating things here can crash Blender, see the top
     if not rt.rigs:
         return
     frame = scene.frame_current
     sub = scene.frame_current_final - frame
-    playing = rt.force_fast or (not rt.rendering and _is_playing())
+    rendering = rt.rendering or not _on_main_thread()
+    playing = rt.force_fast or (not rendering and _is_playing())
     # Fast Preview only while the viewport plays, never for renders
-    fast_allowed = s.fast_preview and playing and not rt.rendering
+    fast_allowed = s.fast_preview and playing and not rendering
     writer = HelperWriter()
     for rig in rt.rigs.values():
         if rig.anim_dirty and _can_edit_data(rt):
@@ -835,6 +936,19 @@ def _read_inputs(rig, ob_eval, shift, fast):
         b.pin = _read_pin(pbe) if b.has_pin_constraint else None
 
 
+def _finite_vec(v):
+    return v is not None and all(math.isfinite(x) for x in v)
+
+
+def _all_finite(rig):
+    for b in rig.bones:
+        if not (_finite_vec(b.pos) and _finite_vec(b.vel) and _finite_vec(b.hpos) and _finite_vec(b.hvel)):
+            return False
+        if not all(math.isfinite(x) for row in b.delta for x in row):
+            return False
+    return True
+
+
 def _converged(rig, snaps):
     for b in rig.bones:
         snap = snaps.get(b.name)
@@ -854,7 +968,11 @@ def frame_post(scene, depsgraph):
     if not s.enabled or depsgraph is None:
         return
     rt = peek(scene)
-    if rt is None or not rt.rigs:
+    if rt is None:
+        return
+    if rt.needs_edit and _can_edit_data(rt):
+        _edit_now(scene, rt)  # the pose is evaluated now, safe to add empties and constraints
+    if not rt.rigs:
         return
     frame = scene.frame_current
     work = []
@@ -919,6 +1037,7 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
 
     fast = rig.fast and mode == SIM
     _read_inputs(rig, ob_eval, shift=(mode == SIM), fast=fast)
+    what = mode.lower()
     if mode != SAME:
         if world is None:
             world = _build_world(scene, s, depsgraph, [w[0] for w in work])
@@ -926,7 +1045,9 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
             solver.prepare_view(rig.bones, 1.0)
             solver.reset(rig.bones)
             if s.preroll and not rt.skip_static_preroll:
-                solver.settle(rig.bones, world, s.preroll * s.substeps)
+                total = s.preroll * s.substeps
+                done = solver.settle(rig.bones, world, total)
+                what += f", preroll {done}/{total} steps"
             rig.key = ("reset", frame, s.preroll)
             rig.converged_key = None
             rig.ready = True
@@ -943,7 +1064,17 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
                 else:
                     rig.key = rt.new_key("loop")
 
-    what = mode.lower()
+    if not _all_finite(rig):
+        # extreme settings or a degenerate pose blew the sim up, never hand that to Blender
+        rt.counts["unstable"] += 1
+        solver.prepare_view(rig.bones, 1.0)
+        solver.reset(rig.bones)
+        if not _all_finite(rig):
+            for b in rig.bones:
+                b.delta = IDENTITY.copy()
+        rig.key = rt.new_key("reset-unstable")
+        history.append((frame, rig.name, "unstable, reset"))
+
     if mode == SIM and decision[3]:
         what += ", looped" + (" (settled)" if rig.key == rig.converged_key else "")
     if fast and depsgraph.mode != "RENDER":
@@ -956,7 +1087,7 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
         what += ", render"
     history.append((frame, rig.name, what))
     rig.last_frame = frame
-    _store(rig, frame, s)
+    _store(rig, frame, s, rt)
     return world
 
 
@@ -966,7 +1097,7 @@ def on_depsgraph_update(scene, depsgraph):
     if not scene.emils_wiggle.enabled:
         return
     rt = peek(scene)
-    if rt is None or not rt.rigs:
+    if rt is None:
         return
     if bpy.app.is_job_running("RENDER"):
         return
@@ -974,6 +1105,13 @@ def on_depsgraph_update(scene, depsgraph):
         rt.rendering = False  # a render ended without telling us, don't stay stuck
     view_layer = getattr(bpy.context, "view_layer", None)
     if view_layer is not None and depsgraph.view_layer.name != view_layer.name:
+        return
+    if rt.needs_edit or _stale(scene, rt):
+        # renamed, added or deleted rigs get set up now, so an F12 right after is right too
+        rt.structure_dirty = True
+        rt.needs_edit = True
+        request_edits()
+    if not rt.rigs:
         return
     action_changed = False
     collections_changed = depsgraph.id_type_updated("COLLECTION")
@@ -1025,7 +1163,7 @@ def after_undo():
                 b.helper = None  # the undo step may have swapped the objects
                 b.shown = None
         if scene.emils_wiggle.enabled:
-            rebuild(scene, rt)
+            rebuild(scene, rt, edit=False)
         else:
             _runtimes.pop(scene.as_pointer(), None)
 

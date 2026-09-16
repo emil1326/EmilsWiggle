@@ -10,7 +10,7 @@ Built for **Blender 3.6 LTS**.
 
 Run `python tools/build_zip.py` (or just zip the `EmilsWiggle` folder, Blender doesn't care about the extra stuff), then Edit > Preferences > Add-ons > Install and turn on **Emil's Wiggle**. You'll find it in the 3D View sidebar, in the **Emil** tab.
 
-If Wiggle 2 is still installed, turn it off. The panel warns you when both are on for the same scene, since two sims fighting over the same bones isn't fun.
+If Wiggle 2 is still installed, turn it off. The panel warns you when both are on for the same scene, since two sims fighting over the same bones isn't fun. Heads up though, Wiggle 2 doesn't clean up after itself when you turn it off while Blender is open (it leaves properties pointing at stuff that doesn't exist anymore, which can crash Blender later). Emil's Wiggle removes those leftovers by itself, but restarting Blender once after turning Wiggle 2 off is the safest.
 
 Got a file that already uses Wiggle 2? There's an **Import Wiggle 2 Settings** button. It shows up by itself when the file has Wiggle 2 bones, and it copies everything over (stiffness, colliders, head/tail, mutes...) and switches Wiggle 2 off for that scene.
 
@@ -40,7 +40,7 @@ Wiggle turns on **Render > Lock Interface** when you enable a scene, and the pan
 
 ### Loops
 
-With **Loop Physics** on, the sim keeps going when the timeline wraps around instead of snapping back. Once a loop plays out the same as the one before, playback just replays the cache from then on, so a settled loop costs almost nothing. **Preroll** runs some frames before the start so things are already settled, and with Loop Physics it prerolls the end of your loop, which is what you want for seamless cycles.
+**Loop Physics** is off by default. Turn it on and the sim keeps going when the timeline wraps around instead of snapping back. Once a loop plays out the same as the one before, playback just replays the cache from then on, so a settled loop costs almost nothing. **Preroll** runs some frames before the start so things are already settled, and with Loop Physics it prerolls the end of your loop, which is what you want for seamless cycles. A preroll stops early once the bones don't move anymore, so a big number doesn't cost much on springy stuff that settles fast.
 
 ### Speed stuff
 
@@ -94,7 +94,11 @@ flowchart TD
     I --> J[Blender evaluates the wiggled bones again]
 ```
 
-The same code runs in the viewport and on the render thread, it only ever uses the scene and depsgraph Blender hands to the handlers. The code is split up like this:
+The same code runs in the viewport and on the render thread, it only ever uses the scene and depsgraph Blender hands to the handlers. Anything that isn't Blender's main thread (F12 and Ctrl+F12, Alembic and USD exports running in the background, other scenes the compositor renders) only reads and moves empties, it never creates or deletes anything.
+
+One more rule that cost me a crash: frame_change_pre never creates empties or constraints either. When you switch scenes (or make a New Scene > Full Copy), Blender builds the new scene's depsgraph, calls frame_change_pre, then builds it again without evaluating in between, and 3.6 dies in that second build if something got added. So new rigs get their empties in frame_change_post, or from a timer right after an edit.
+
+The code is split up like this:
 
 | File | What's in it |
 |---|---|
@@ -103,12 +107,17 @@ The same code runs in the viewport and on the render thread, it only ever uses t
 | `props.py` | Every setting, saved in the .blend and library overridable |
 | `handlers.py` | Blender app handlers |
 | `operators.py` | Buttons: reset, simulate, bake, copy, select, import |
-| `debug.py` | Developer Tools: the add-on preference, the debug report |
+| `debug.py` | Developer Tools: the add-on preference, the debug report, the crash log |
+| `legacy.py` | Cleaning up what Wiggle 2 leaves behind when it gets turned off |
 | `ui.py` | The sidebar panels |
 
 ## When something acts weird
 
 Turn on **Developer Tools** in Preferences > Add-ons > Emil's Wiggle. A **Debug** panel shows up at the bottom, with counters and a **Copy Debug Report** button. The report has the settings of every wiggle bone, what the last frames did (cache, sim, fast preview, render...) and the last error, so paste that along with what you saw.
+
+If Blender straight up crashes, there's a **Crash Log** too (on by default, same preferences). It only writes something when Blender dies, and then it says what Python was doing at that exact moment, which Blender's own crash file usually doesn't. It lives at `%TEMP%\emils_wiggle_crash.log`, and the Debug panel has a button to open it.
+
+And if Blender closes by itself a second after starting, over and over, until you reboot? That was never the add-on for me, it was the Huion tablet driver xD Set Preferences > Input > Tablet API to Windows Ink and it stops.
 
 ## Tests
 
@@ -118,15 +127,19 @@ Two suites, both run with one command (plain Python, it finds Blender 3.6 by its
 python tests/run_all.py
 ```
 
-The background one builds rigs, plays them, renders with Cycles and Workbench, saves and reloads, bakes and draws every panel (69 passed last run on Blender 3.6.23). Background mode can't do real playback or threaded renders though, so the second one opens its own little Blender window, plays, stops, does a Ctrl+F12 with and without the cache plus an F12, checks everything and closes itself (12 passed). `--headless` or `--gui` runs just one of them, `-v` shows every check.
+The background one builds rigs, plays them, renders with Cycles and Workbench, saves and reloads, bakes and draws every panel (104 passed last run on Blender 3.6.23). Background mode can't do real playback or threaded renders though, so the second one opens its own little Blender window, plays, stops, does a Ctrl+F12 with and without the cache plus an F12, copies and switches scenes, exports an Alembic in the background, checks everything and closes itself (23 passed). `--headless` or `--gui` runs just one of them, `-v` shows every check.
 
 Every bug that gets fixed gets its own test in there too, so it can't sneak back in.
+
+Then there's the mean one, `python tests/run_all.py --stress`. It throws hundreds of random things at Blender with the add-on on: new and deleted rigs, renames, edit mode changes, crazy settings (zero scale, huge stiffness...), deleting colliders or even our own empties, scene copies, renders with motion blur or another scene in the compositor, Alembic and USD exports, linked and overridden rigs, rigs parented to other rigs, reloading the file or File > New, turning the add-on off and on, and in the GUI version also undo, redo, viewport renders and editing while the animation plays. It also flags any single action that takes more than 5 seconds. Every action gets logged before it runs, so if something ever crashes the log says exactly what did it. `--seeds` and `--ops` make it longer.
 
 `python tools/build_zip.py` makes the installable zip in `../dist`.
 
 ## Known limits
 
 - The cache lives in memory, so after reopening a file you need to play or Simulate Range again before rendering a single frame from the middle. Animation renders are fine either way.
+- The cache keeps about 250 000 bone-frames per scene (a couple hundred MB, so like 2500 frames of a 100 bone rig). Past that, the frames furthest from where you are get dropped and simulate again if you go back there.
+- A rig in a scene that was never shown in the viewport renders without wiggle if you render it straight away, since nothing can be created during a render (a compositor node pulling in another scene, for example). Look at that scene once first.
 - Linked armatures need a library override (Blender won't let anything add constraints otherwise).
 - Fast Preview is viewport playback only, on purpose.
 

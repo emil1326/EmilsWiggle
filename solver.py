@@ -533,11 +533,34 @@ def simulate(bones, world, steps):
         step(bones, world)
 
 
+SETTLE_WINDOW = 10
+SETTLE_TOL = 1e-5  # of the bone's world length
+
+
+def _still(bones, ref):
+    for b, (pos, hpos) in zip(bones, ref):
+        tol = SETTLE_TOL * b.v_len_world
+        if ((b.pos - pos).length > tol or b.vel.length > tol
+                or (b.hpos - hpos).length > tol or b.hvel.length > tol):
+            return False
+    return True
+
+
 def settle(bones, world, steps):
-    """Preroll: simulate with the pose held still."""
+    """Preroll: simulate with the pose held still. Returns how many steps it took.
+
+    Nothing changes between steps but the bones themselves, so once they stop moving
+    for a whole window the rest of the preroll would do nothing and gets skipped.
+    """
     prepare_view(bones, 1.0)
-    for _ in range(steps):
+    ref = None
+    for i in range(steps):
         step(bones, world)
+        if (i + 1) % SETTLE_WINDOW == 0:
+            if ref is not None and _still(bones, ref):
+                return i + 1
+            ref = [(b.pos.copy(), b.hpos.copy()) for b in bones]
+    return steps
 
 
 # ---------------------------------------------------------------- snapshots

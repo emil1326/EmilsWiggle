@@ -9,7 +9,7 @@
 bl_info = {
     "name": "Emil's Wiggle",
     "author": "Emil (fork of Wiggle 2 by Steve Miller)",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Emil",
     "description": "Spring physics on bones that works live and in renders, no baking needed",

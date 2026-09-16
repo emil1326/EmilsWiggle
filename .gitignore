@@ -4,3 +4,6 @@ __pycache__/
 *.zip
 result*.txt
 *.txt.log
+
+# Emil's own test scenes, not part of the add-on
+BlenderTests/

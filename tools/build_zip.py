@@ -15,7 +15,7 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKAGE = "EmilsWiggle"
-SKIP_DIRS = {"tests", "tools", ".git", "__pycache__", ".vscode", ".claude"}
+SKIP_DIRS = {"tests", "tools", "BlenderTests", ".git", "__pycache__", ".vscode", ".claude"}
 SKIP_FILES = {".gitignore", ".gitattributes", "CLAUDE.md"}
 
 

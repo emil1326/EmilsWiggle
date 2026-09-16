@@ -4,7 +4,7 @@ Emil's Wiggle - sidebar panels (View3D > Sidebar > Emil).
 
 import bpy
 
-from . import debug, handlers, legacy, runtime
+from . import background, debug, handlers, legacy, runtime
 
 
 class EmilsWigglePanel:
@@ -186,6 +186,13 @@ class EMILSWIGGLE_PT_simulation(EmilsWigglePanel, bpy.types.Panel):
         col.prop(s, "preroll")
         layout.prop(s, "loop")
         layout.prop(s, "fast_preview")
+        rt = runtime.peek(scene)
+        if s.fast_preview and rt is not None:
+            for rig in rt.rigs.values():
+                if rig.fast_reason:
+                    col = layout.column(align=True)
+                    col.label(text=f"Fast Preview can't work on {rig.name}:", icon="INFO")
+                    col.label(text=rig.fast_reason)
         layout.prop(s, "use_cache")
 
         count, first, last = runtime.cache_info(scene)
@@ -199,9 +206,16 @@ class EMILSWIGGLE_PT_simulation(EmilsWigglePanel, bpy.types.Panel):
         col.label(text=f"Frame {scene.frame_current}: " + ("cached" if here else "not cached"),
                   icon="KEYFRAME_HLT" if here else "KEYFRAME")
 
+        text = background.status(scene)
+        if text:
+            col.label(text=text, icon="SORTTIME")
+
         row = box.row(align=True)
         row.prop(s, "cache_locked", icon="LOCKED" if s.cache_locked else "UNLOCKED", toggle=True)
         row.operator("emils_wiggle.clear_cache", icon="TRASH", text="")
+        prefs = debug.preferences(context)
+        if prefs is not None:
+            box.prop(prefs, "background_cache")
 
         col = layout.column(align=True)
         col.operator("emils_wiggle.simulate", icon="PLAY")
@@ -264,8 +278,11 @@ class EMILSWIGGLE_PT_debug(EmilsWigglePanel, bpy.types.Panel):
         if rt is None:
             col.label(text="Not running on this scene")
         else:
-            col.label(text=f"Last step: {rt.stats_sim_ms:.2f} ms", icon="TIME")
-            for key in ("CACHE", "SIM", "RESET", "SAME", "fast", "converged", "errors"):
+            col.label(text=f"Physics, last frame: {rt.stats_sim_ms:.2f} ms", icon="TIME")
+            if rt.frame_ms > 0.0:
+                col.label(text=f"Last playback: {1000.0 / rt.frame_ms:.1f} fps ({rt.frame_ms:.0f} ms a frame)",
+                          icon="PLAY")
+            for key in ("CACHE", "SIM", "RESET", "SAME", "fast", "dropped frames", "converged", "errors"):
                 if rt.counts.get(key):
                     col.label(text=f"{key}: {rt.counts[key]}")
             for rig in rt.rigs.values():

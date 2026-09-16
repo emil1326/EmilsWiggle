@@ -47,7 +47,8 @@ from . import solver
 CONSTRAINT_NAME = "Emil's Wiggle"
 HELPER_TAG = "emils_wiggle_helper"
 HELPER_COLLECTION = "EmilsWiggle Helpers"
-MAX_SKIP = 4
+MAX_SKIP = 4  # frames simulated in one go when scrubbing forward; more is treated as a jump
+MAX_STRETCH = 2.0  # longest step (in frames) when playback drops more frames than that
 CACHE_BUDGET = 250_000  # cached bone-frames per scene (about 1.4 KB each), far frames go first
 PIN_TYPES = {"DAMPED_TRACK", "TRACK_TO", "LOCKED_TRACK"}
 IDENTITY = Matrix.Identity(4)
@@ -79,8 +80,14 @@ class RigRuntime:
         self.fast_ok = False
         self.fast = False
         self.colliders = set()
+        self.collider_colls = set()  # collider collections the colliders came from
         self.winds = set()
-        self.cache = {}
+        self.cache = {}  # frame -> (key, {bone: snapshot}, approximate)
+        self.cache_gen = 0  # goes up whenever the cache gets cleared
+        self.approx = False  # the state came from skipped frames, don't let it replace exact ones
+        self.bg_done = None  # cache_gen the background cache finished (or gave up) on
+        self.bg_reason = ""
+        self.fast_reason = ""
         self.pending = None
         self.pre_applied = set()
 
@@ -96,8 +103,13 @@ class SceneRuntime:
         self.force_fast = False
         self.rendering = False
         self.needs_edit = False  # a read-only rebuild left empties/constraints to set up
+        self.scene_sig = None  # fps and gravity the cache was made with
+        self.collider_state = {}  # view layer -> which colliders are visible / in collider collections
         self.legacy_found = False
         self.stats_sim_ms = 0.0
+        self.frame_ms = 0.0  # playback: time between frames
+        self.last_play_frame = None
+        self.last_play_time = 0.0
         self.counts = Counter()
 
     def new_key(self, tag):
@@ -295,6 +307,9 @@ def neutralize_helpers():
         ob.update_tag(refresh={"OBJECT"})
 
 
+bad_writes = 0  # empties that would have gotten a non-finite transform (debug report)
+
+
 class HelperWriter:
     """Moves the empties in one go.
 
@@ -313,6 +328,7 @@ class HelperWriter:
         b.shown = m.copy()
 
     def flush(self):
+        global bad_writes
         if not self.jobs:
             return 0
         coll = helper_collection(create=False)
@@ -335,6 +351,10 @@ class HelperWriter:
                     rt.structure_dirty = True
                 continue
             l, r, sc = m.decompose()
+            values = l[:] + r[:] + sc[:]
+            if not all(math.isfinite(x) and abs(x) < MAX_POSITION for x in values):
+                l, r, sc = (0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0)  # never hand Blender inf/nan
+                bad_writes += 1
             loc[3 * i:3 * i + 3] = l[:]
             rot[4 * i:4 * i + 4] = r[:]
             sca[3 * i:3 * i + 3] = sc[:]
@@ -531,20 +551,31 @@ def request_edits():
     bpy.app.timers.register(_apply_edits, first_interval=0.0)
 
 
+def _fast_problem(pb):
+    bone = pb.bone
+    others = [c.name for c in pb.constraints if c.name != CONSTRAINT_NAME]
+    if others:
+        return f"'{pb.name}' has another constraint ({others[0]})"
+    if not bone.use_inherit_rotation:
+        return f"'{pb.name}' doesn't inherit rotation"
+    if bone.inherit_scale != "FULL":
+        return f"'{pb.name}' doesn't inherit scale fully"
+    if not bone.use_local_location:
+        return f"'{pb.name}' has Local Location off"
+    if bone.use_relative_parent:
+        return f"'{pb.name}' uses Relative Parenting"
+    return ""
+
+
 def _check_fast(rig, ob):
-    ok = True
+    reason = ""
     for name, _parent in rig.involved:
         pb = ob.pose.bones.get(name)
-        if pb is None:
-            ok = False
+        reason = f"'{name}' is missing" if pb is None else _fast_problem(pb)
+        if reason:
             break
-        bone = pb.bone
-        others = [c for c in pb.constraints if c.name != CONSTRAINT_NAME]
-        if (not bone.use_inherit_rotation or bone.inherit_scale != "FULL" or not bone.use_local_location
-                or bone.use_relative_parent or others):
-            ok = False
-            break
-    rig.fast_ok = ok
+    rig.fast_ok = not reason
+    rig.fast_reason = reason
 
 
 def detect_settings_animated(rig, ob):
@@ -588,12 +619,14 @@ def _read_side(src, scene):
     sd.sticky = src.sticky
     sd.chain = src.chain
     colliders = []
+    sd.collection = None
     if src.collider_type == "Object":
         c = _orig(src.collider)
         if c is not None and c.type == "MESH" and scene.objects.get(c.name) == c:
             colliders.append(c.name)
     else:
         coll = _orig(src.collider_collection)
+        sd.collection = coll.name if coll is not None else None
         if coll is not None and (coll == scene.collection or coll in scene.collection.children_recursive):
             colliders = [o.name for o in coll.all_objects if o.type == "MESH"]
     sd.colliders = colliders
@@ -603,6 +636,7 @@ def _read_side(src, scene):
 def refresh_settings(scene, rig, ob, ob_eval):
     """Read the settings, from the evaluated armature so animated values are right in renders."""
     rig.colliders = set()
+    rig.collider_colls = set()
     rig.winds = set()
     bones = ob.pose.bones
     bones_eval = ob_eval.pose.bones
@@ -617,6 +651,8 @@ def refresh_settings(scene, rig, ob, ob_eval):
         for side, used in ((b.tail, b.has_tail), (b.head, b.has_head)):
             if used:
                 rig.colliders.update(side.colliders)
+                if side.collection:
+                    rig.collider_colls.add(side.collection)
                 if side.wind_ob:
                     rig.winds.add(side.wind_ob)
         b.has_pin_constraint = b.has_tail and any(c.type in PIN_TYPES for c in pb.constraints)
@@ -644,6 +680,7 @@ def invalidate(rig, force=False, scene=None):
     if not force and scene is not None and scene.emils_wiggle.cache_locked:
         return
     rig.cache.clear()
+    rig.cache_gen += 1
     rig.converged_key = None
 
 
@@ -676,9 +713,10 @@ def frame_is_cached(scene, frame):
 
 
 def _store(rig, frame, s, rt=None):
-    if s.cache_locked and frame in rig.cache:
-        return
-    entry = (rig.key, {b.name: solver.snapshot(b) for b in rig.bones})
+    old = rig.cache.get(frame)
+    if old is not None and (s.cache_locked or (rig.approx and not old[2])):
+        return  # locked, or an exact frame that a result from skipped frames shouldn't replace
+    entry = (rig.key, {b.name: solver.snapshot(b) for b in rig.bones}, rig.approx)
     if not s.use_cache:
         # keep the frame before too, motion blur needs its neighbours
         rig.cache = {f: e for f, e in rig.cache.items() if f == frame - 1}
@@ -688,9 +726,37 @@ def _store(rig, frame, s, rt=None):
         _trim_cache(rt, rig, frame)
 
 
+def cache_total(rt):
+    """Cached bone-frames in a scene, what CACHE_BUDGET counts."""
+    return sum(len(r.cache) * max(1, len(r.bones)) for r in rt.rigs.values())
+
+
+def store_background(rt, rig, frame, key, snaps):
+    """A frame the background cache simulated. Returns False once the cache is nearly full."""
+    if cache_total(rt) >= CACHE_BUDGET * 0.85:
+        return False
+    rig.cache[frame] = (key, snaps, False)
+    return True
+
+
+def reset_key(frame, s):
+    """Key of a simulation that starts from rest at `frame` (what playback does)."""
+    return ("reset", frame, s.preroll)
+
+
+def _restore_frame(rig, frame):
+    key, snaps, approx = rig.cache[frame]
+    for b in rig.bones:
+        snap = snaps.get(b.name)
+        if snap is not None:
+            solver.restore(b, snap)
+    rig.key = key
+    rig.approx = approx
+
+
 def _trim_cache(rt, rig, frame):
     """A very long timeline shouldn't eat all the memory: drop the frames furthest away."""
-    total = sum(len(r.cache) * max(1, len(r.bones)) for r in rt.rigs.values())
+    total = cache_total(rt)
     if total <= CACHE_BUDGET:
         return
     per = max(1, len(rig.bones))
@@ -756,7 +822,19 @@ def _is_playing():
     return any(w.screen is not None and w.screen.is_animation_playing for w in wm.windows)
 
 
-def _decide(scene, s, rig, frame, playing):
+def _max_skip(scene, playing, rendering):
+    """How many frames forward still count as "the next frame" instead of a jump."""
+    if rendering:
+        return max(MAX_SKIP, scene.frame_step)  # renders with a Frame Step
+    if playing:
+        # slow playback drops frames, keep simulating through them instead of starting over
+        r = scene.render
+        return max(MAX_SKIP, int(round(r.fps / r.fps_base)))
+    return MAX_SKIP
+
+
+def _decide(scene, s, rig, frame, playing, rendering=False):
+    """(CACHE|RESET|SAME, frame) or (SIM, frame, frames to advance, looped, restart from frame)."""
     entry = rig.cache.get(frame)
     if not rig.ready:
         return (CACHE, frame) if entry is not None else (RESET, frame)
@@ -765,22 +843,32 @@ def _decide(scene, s, rig, frame, playing):
         return (CACHE, frame) if entry is not None else (SAME, frame)
     if entry is not None and s.cache_locked:
         return (CACHE, frame)
+    most = _max_skip(scene, playing, rendering)
     k = None
     wrap = False
+    restart = None
     if last is not None:
-        if 0 < frame - last <= MAX_SKIP:
+        if 0 < frame - last <= most:
             k = frame - last
-        elif s.loop and playing and frame < last:
+        elif playing and frame < last:
             # only real playback loops around, a render or a jump back to the start doesn't
             start, end = playback_range(scene)
-            e = (end - last) + (frame - start) + 1
-            if last <= end and frame >= start and 0 < e <= MAX_SKIP:
-                k, wrap = e, True
+            if s.loop:
+                e = (end - last) + (frame - start) + 1
+                if last <= end and frame >= start and 0 < e <= most:
+                    k, wrap = e, True
+            elif entry is None and start < frame <= start + most:
+                # looped while dropping frames: carry on from the cached first frame
+                first = rig.cache.get(start)
+                if first is not None and first[0] == reset_key(start, s) and not first[2]:
+                    k, restart = frame - start, start
     if k is not None:
-        # replaying the same run, or a loop that already settled into a repeat
-        if entry is not None and entry[0] == rig.key and (not wrap or rig.key == rig.converged_key):
-            return (CACHE, frame)
-        return (SIM, frame, k, wrap)
+        if entry is not None and restart is None:
+            if entry[0] == rig.key and (not wrap or rig.key == rig.converged_key):
+                return (CACHE, frame)  # replaying the same run, or a loop that settled into a repeat
+            if rig.approx and not entry[2] and not wrap:
+                return (CACHE, frame)  # back onto an exact run after skipping frames
+        return (SIM, frame, k, wrap, restart)
     if entry is not None and s.use_cache:
         return (CACHE, frame)
     return (RESET, frame)
@@ -799,6 +887,66 @@ def _subframe_delta(rig, b, frame, t):
     if d0 is not None and dp is not None:
         return dp.lerp(d0, 1.0 + t)  # next frame isn't known yet, carry on the motion
     return d0 if d0 is not None else b.delta
+
+
+def _scene_signature(scene):
+    """Scene settings the simulation depends on (animated ones are left out, they'd change every frame)."""
+    r = scene.render
+    ad = scene.animation_data
+    animated = set()
+    if ad is not None:
+        sources = list(ad.drivers) + (list(ad.action.fcurves) if ad.action is not None else [])
+        animated = {fc.data_path for fc in sources}
+    return (
+        None if "render.fps" in animated else r.fps,
+        None if "render.fps_base" in animated else r.fps_base,
+        scene.use_gravity,
+        None if "gravity" in animated else tuple(scene.gravity),
+    )
+
+
+def _collider_state(scene, rt, depsgraph):
+    """What collisions depend on: visible colliders/winds and what's in the collider collections."""
+    names = set()
+    colls = set()
+    for rig in rt.rigs.values():
+        names |= rig.colliders | rig.winds
+        colls |= rig.collider_colls
+    visible = set()
+    for name in names:
+        ob = scene.objects.get(name)
+        if ob is not None and ob.evaluated_get(depsgraph).as_pointer() != ob.as_pointer():
+            visible.add(name)
+    members = []
+    inside = None
+    for name in sorted(colls):
+        coll = bpy.data.collections.get(name)
+        if coll is None:
+            members.append((name, None))
+            continue
+        if inside is None:
+            inside = {c.as_pointer() for c in scene.collection.children_recursive}
+        found = coll.as_pointer() in inside
+        members.append((name, found and frozenset(o.name for o in coll.all_objects if o.type == "MESH")))
+    return frozenset(visible), tuple(members)
+
+
+def _colliders_changed(scene, rt, depsgraph):
+    """Remember the collider state for this depsgraph's view layer. True if it differs from last time."""
+    key = depsgraph.view_layer.name
+    state = _collider_state(scene, rt, depsgraph)
+    old = rt.collider_state.get(key)
+    rt.collider_state[key] = state
+    return old is not None and old != state
+
+
+def _check_scene_settings(scene, rt):
+    sig = _scene_signature(scene)
+    if sig != rt.scene_sig:
+        if rt.scene_sig is not None:
+            for rig in rt.rigs.values():
+                invalidate(rig, scene=scene)  # another fps or gravity: every cached frame is off
+        rt.scene_sig = sig
 
 
 def _stale(scene, rt):
@@ -820,6 +968,18 @@ def _validate(scene, rt, edit):
         rebuild(scene, rt, edit)
 
 
+def _time_playback(rt, frame):
+    now = time.perf_counter()
+    if rt.last_play_frame is not None and now - rt.last_play_time < 2.0:
+        ms = (now - rt.last_play_time) * 1000.0
+        rt.frame_ms = ms if rt.frame_ms <= 0.0 else rt.frame_ms * 0.8 + ms * 0.2
+        jump = frame - rt.last_play_frame
+        if jump > 1:
+            rt.counts["dropped frames"] += jump - 1
+    rt.last_play_frame = frame
+    rt.last_play_time = now
+
+
 def frame_pre(scene):
     s = scene.emils_wiggle
     if not s.enabled:
@@ -829,10 +989,13 @@ def frame_pre(scene):
     _validate(scene, rt, edit=False)  # creating things here can crash Blender, see the top
     if not rt.rigs:
         return
+    _check_scene_settings(scene, rt)
     frame = scene.frame_current
     sub = scene.frame_current_final - frame
     rendering = rt.rendering or not _on_main_thread()
     playing = rt.force_fast or (not rendering and _is_playing())
+    if playing and not rendering and not rt.force_fast and frame != rt.last_play_frame:
+        _time_playback(rt, frame)
     # Fast Preview only while the viewport plays, never for renders
     fast_allowed = s.fast_preview and playing and not rendering
     writer = HelperWriter()
@@ -849,7 +1012,7 @@ def frame_pre(scene):
             for b in rig.bones:
                 writer.show(b, _subframe_delta(rig, b, frame, sub))
             continue
-        decision = _decide(scene, s, rig, frame, playing)
+        decision = _decide(scene, s, rig, frame, playing, rendering)
         rig.pending = decision
         rig.fast = fast_allowed and rig.fast_ok and decision[0] == SIM
         snaps = rig.cache[frame][1] if decision[0] == CACHE else None
@@ -936,16 +1099,27 @@ def _read_inputs(rig, ob_eval, shift, fast):
         b.pin = _read_pin(pbe) if b.has_pin_constraint else None
 
 
+MAX_POSITION = 1e7  # past this float32 is garbage anyway
+MAX_DELTA_SCALE = 1e3  # a wiggle offset is a rotation and a bit of stretch, nowhere near this
+
+
 def _finite_vec(v):
-    return v is not None and all(math.isfinite(x) for x in v)
+    return v is not None and all(math.isfinite(x) and abs(x) < MAX_POSITION for x in v)
 
 
 def _all_finite(rig):
+    """False when the sim blew up: non-finite values, or finite ones so big that Blender would
+    turn them into inf (a scale of 1e20 decomposes to an infinite float32 scale)."""
     for b in rig.bones:
         if not (_finite_vec(b.pos) and _finite_vec(b.vel) and _finite_vec(b.hpos) and _finite_vec(b.hvel)):
             return False
-        if not all(math.isfinite(x) for row in b.delta for x in row):
-            return False
+        d = b.delta
+        for i in range(3):
+            if not (math.isfinite(d[i][3]) and abs(d[i][3]) < MAX_POSITION):
+                return False
+            for j in range(3):
+                if not (math.isfinite(d[i][j]) and abs(d[i][j]) < MAX_DELTA_SCALE):
+                    return False
     return True
 
 
@@ -998,11 +1172,13 @@ def frame_post(scene, depsgraph):
     t0 = time.perf_counter()
     world = None
     writer = HelperWriter()
+    refreshed = False
     try:
         for rig, ob, ob_eval, decision in work:
             try:
                 if rig.settings_dirty or rig.settings_animated:
                     refresh_settings(scene, rig, ob, ob_eval)
+                    refreshed = True
                 world = _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writer)
             except Exception:
                 # one broken rig shouldn't stop the others, it starts over next frame
@@ -1015,6 +1191,8 @@ def frame_post(scene, depsgraph):
                 traceback.print_exc()
     finally:
         writer.flush()
+    if refreshed and depsgraph.mode == "VIEWPORT" and _on_main_thread():
+        _colliders_changed(scene, rt, depsgraph)  # what later collection updates get compared with
     rt.stats_sim_ms = (time.perf_counter() - t0) * 1000.0
 
 
@@ -1024,20 +1202,18 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
     rt.counts[mode] += 1
 
     if mode == CACHE:
-        key, snaps = rig.cache[frame]
-        for b in rig.bones:
-            snap = snaps.get(b.name)
-            if snap is not None:
-                solver.restore(b, snap)
-        rig.key = key
+        _restore_frame(rig, frame)
         rig.last_frame = frame
         rig.ready = all(b.ready for b in rig.bones)
         history.append((frame, rig.name, "cache"))
         return world
 
+    what = mode.lower()
+    if mode == SIM and decision[4] is not None:
+        _restore_frame(rig, decision[4])  # looped while dropping frames, go on from the first frame
+        what += f", from frame {decision[4]}"
     fast = rig.fast and mode == SIM
     _read_inputs(rig, ob_eval, shift=(mode == SIM), fast=fast)
-    what = mode.lower()
     if mode != SAME:
         if world is None:
             world = _build_world(scene, s, depsgraph, [w[0] for w in work])
@@ -1048,21 +1224,31 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
                 total = s.preroll * s.substeps
                 done = solver.settle(rig.bones, world, total)
                 what += f", preroll {done}/{total} steps"
-            rig.key = ("reset", frame, s.preroll)
+            rig.key = reset_key(frame, s)
+            rig.approx = False
             rig.converged_key = None
             rig.ready = True
         else:
-            solver.simulate(rig.bones, world, decision[2] * s.substeps)
-            if decision[3]:  # the timeline looped
+            k, wrap = decision[2], decision[3]
+            # dropped frames: at most MAX_SKIP frames of steps, each one a bit longer
+            frames = min(k, MAX_SKIP)
+            solver.simulate(rig.bones, world, frames * s.substeps, min(k / frames, MAX_STRETCH))
+            if k > 1:
+                what += f", {k} frames at once"
+            if wrap:  # the timeline looped
                 entry = rig.cache.get(frame)
-                if entry is not None and _converged(rig, entry[1]):
+                if k == 1 and entry is not None and _converged(rig, entry[1]):
                     # this loop repeats the previous one, replay it from now on
-                    rig.key = rig.converged_key = entry[0]
-                    for b in rig.bones:
-                        solver.restore(b, entry[1][b.name])
+                    _restore_frame(rig, frame)
+                    rig.converged_key = rig.key
                     rt.counts["converged"] += 1
                 else:
                     rig.key = rt.new_key("loop")
+                    rig.approx = rig.approx or k > 1
+            elif k > 1:
+                # the frames in between were guessed, keep this run apart from exact ones
+                rig.key = rt.new_key("skip")
+                rig.approx = True
 
     if not _all_finite(rig):
         # extreme settings or a degenerate pose blew the sim up, never hand that to Blender
@@ -1073,6 +1259,7 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
             for b in rig.bones:
                 b.delta = IDENTITY.copy()
         rig.key = rt.new_key("reset-unstable")
+        rig.approx = True
         history.append((frame, rig.name, "unstable, reset"))
 
     if mode == SIM and decision[3]:
@@ -1106,6 +1293,7 @@ def on_depsgraph_update(scene, depsgraph):
     view_layer = getattr(bpy.context, "view_layer", None)
     if view_layer is not None and depsgraph.view_layer.name != view_layer.name:
         return
+    _check_scene_settings(scene, rt)
     if rt.needs_edit or _stale(scene, rt):
         # renamed, added or deleted rigs get set up now, so an F12 right after is right too
         rt.structure_dirty = True
@@ -1114,7 +1302,12 @@ def on_depsgraph_update(scene, depsgraph):
     if not rt.rigs:
         return
     action_changed = False
-    collections_changed = depsgraph.id_type_updated("COLLECTION")
+    # Collection updates come for all sorts of reasons (deleting any object tags every collection
+    # in the file, and the background cache adds and removes objects), so look at what matters.
+    # (hiding or excluding a collection only shows up as an update of the scene)
+    maybe = depsgraph.id_type_updated("COLLECTION") or any(isinstance(u.id, bpy.types.Scene)
+                                                           for u in depsgraph.updates)
+    collections_changed = maybe and _colliders_changed(scene, rt, depsgraph)
     touched = set()
     armatures = set()
     for u in depsgraph.updates:
@@ -1145,9 +1338,19 @@ def on_depsgraph_update(scene, depsgraph):
             rig.anim_dirty = True
         if rig.name in touched:
             rt.structure_dirty = True  # bones or our constraints might have changed
-        if (action_changed or collections_changed or rig.name in touched
-                or (rig.colliders & touched) or (rig.winds & touched)):
-            invalidate(rig, scene=scene)
+        if action_changed:
+            why = "an action changed"
+        elif collections_changed:
+            why = "collections changed"
+        elif rig.name in touched:
+            why = "the rig changed"
+        elif (rig.colliders | rig.winds) & touched:
+            why = "a collider or wind moved"
+        else:
+            continue
+        if rig.cache:
+            rt.counts["cache cleared: " + why] += 1
+        invalidate(rig, scene=scene)
 
 
 def after_undo():
@@ -1184,6 +1387,7 @@ def playback_stopped(scene):
     rt = peek(scene)
     if rt is None or not scene.emils_wiggle.enabled:
         return
+    rt.last_play_frame = None
     writer = HelperWriter()
     written = set()
     for rig in rt.rigs.values():

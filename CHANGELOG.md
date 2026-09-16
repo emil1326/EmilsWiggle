@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.0 (2026-09-16)
+
+Background caching, and slow playback that doesn't fall apart.
+
+- Background Cache: leave Blender alone for 15 seconds and the frames that aren't cached yet get simulated quietly, in a hidden scene that only has copies of the rigs, so your timeline and viewport never move and heavy meshes aren't evaluated. It works in small slices, stops as soon as you do anything, and its frames are exactly what playback gives. It can be turned off in the add-on preferences or the cache box.
+- Slow playback that drops frames restarted the wiggle whenever it skipped more than 4 frames (with Loop Physics off it looked like rewinding). It keeps simulating through skipped frames now, and those guessed frames never replace exact ones in the cache.
+- Renders with a Frame Step bigger than 4 restarted the wiggle on every frame, they don't anymore.
+- When playback loops while dropping frames, the sim goes on from the cached first frame instead of starting from rest wherever it landed.
+- The panel says why Fast Preview can't be used on a rig, and the Debug panel shows the real playback fps (the physics time never changed with Fast Preview, that's normal) and why the cache got cleared.
+- Changing the frame rate or the gravity clears the cache now.
+- Deleting some unrelated object doesn't clear the cache anymore (Blender marks every collection as changed when an object goes away).
+- Really extreme settings could blow a wiggle offset up so much that Blender turned it into an infinite scale on the empty. That counts as blown up now (the sim resets), and the empties never get inf or nan values no matter what.
+- Saving could crash Blender when the file had library overrides and Wiggle 2 had been turned off during the session (its leftover properties point at freed memory). The stress test found it, and those leftovers are now removed before every save, after loading a file and when Emil's Wiggle starts, on top of the cleanup that already happened.
+
 ## 1.1.0 (2026-09-16)
 
 Stability pass. Blender was crashing on me and I wanted this thing rock solid, so it got a stress test that throws hundreds of random edits, renders, undos and file reloads at it, plus fixes for everything a code review turned up.

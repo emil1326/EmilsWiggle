@@ -10,7 +10,7 @@ import tempfile
 import time
 
 import bpy
-from bpy.props import BoolProperty
+from bpy.props import BoolProperty, IntProperty
 
 from . import handlers, runtime
 
@@ -66,6 +66,15 @@ class EmilsWigglePreferences(bpy.types.AddonPreferences):
         name="Developer Tools",
         description="Show a Debug panel with counters and a button that copies a debug report",
         default=False)
+    background_cache: BoolProperty(
+        name="Background Cache",
+        description="When you don't touch anything for a while, quietly simulate the frames that aren't "
+                    "cached yet. It works in short slices and stops as soon as you do something",
+        default=True)
+    background_delay: IntProperty(
+        name="Start After",
+        description="Seconds without doing anything before the background cache starts",
+        default=15, min=2, max=600)
     crash_log: BoolProperty(
         name="Crash Log",
         description="If Blender crashes, write what Python was doing at that moment to a log file "
@@ -74,15 +83,23 @@ class EmilsWigglePreferences(bpy.types.AddonPreferences):
 
     def draw(self, context):
         col = self.layout.column()
+        row = col.row()
+        row.prop(self, "background_cache")
+        sub = row.row()
+        sub.enabled = self.background_cache
+        sub.prop(self, "background_delay", text="After (s)")
         col.prop(self, "show_debug")
         col.prop(self, "crash_log")
         if self.crash_log:
             col.label(text=CRASH_LOG, icon="FILE_TEXT")
 
 
-def _prefs(context):
-    addon = context.preferences.addons.get(__package__)
+def preferences(context):
+    addon = getattr(context, "preferences", bpy.context.preferences).addons.get(__package__)
     return addon.preferences if addon is not None else None
+
+
+_prefs = preferences
 
 
 def debug_enabled(context):
@@ -161,14 +178,23 @@ def build_report(context):
         counts = ", ".join(f"{k} {v}" for k, v in sorted(rt.counts.items())) or "none"
         lines.append(f"counters: {counts}")
         lines.append(f"last step {rt.stats_sim_ms:.2f} ms, handler errors {handlers.error_count},"
-                     f" setup pending {_yes(rt.needs_edit)}")
+                     f" setup pending {_yes(rt.needs_edit)}, blocked bad empty values {runtime.bad_writes}")
+        if rt.frame_ms > 0.0:
+            lines.append(f"last playback {1000.0 / rt.frame_ms:.1f} fps ({rt.frame_ms:.0f} ms a frame)")
+        from . import background
+        enabled, delay = background._settings()
+        lines.append(f"background cache {'on' if enabled else 'off'} after {delay:g}s: "
+                     f"{background.status(scene) or 'idle'}, {background.stats}")
+        if background.last_error:
+            lines.append("background cache error: " + background.last_error.strip().splitlines()[-1])
         lines.append("rigs:")
         for rig in rt.rigs.values():
             tails = sum(b.has_tail for b in rig.bones)
             heads = sum(b.has_head for b in rig.bones)
             lines.append(
                 f"  {rig.name}: {_n(len(rig.bones), 'bone')} ({tails} tail, {heads} head), ready {_yes(rig.ready)},"
-                f" last frame {rig.last_frame}, cached {len(rig.cache)}, fast preview ok {_yes(rig.fast_ok)},"
+                f" last frame {rig.last_frame}, cached {len(rig.cache)}, approx {_yes(rig.approx)},"
+                f" fast preview {'ok' if rig.fast_ok else 'no (' + rig.fast_reason + ')'},"
                 f" settings animated {_yes(rig.settings_animated)},"
                 f" colliders {sorted(rig.colliders) or '-'}, winds {sorted(rig.winds) or '-'}")
             ob = scene.objects.get(rig.name)

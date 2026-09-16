@@ -10,7 +10,7 @@ Built for **Blender 3.6 LTS**.
 
 Run `python tools/build_zip.py` (or just zip the `EmilsWiggle` folder, Blender doesn't care about the extra stuff), then Edit > Preferences > Add-ons > Install and turn on **Emil's Wiggle**. You'll find it in the 3D View sidebar, in the **Emil** tab.
 
-If Wiggle 2 is still installed, turn it off. The panel warns you when both are on for the same scene, since two sims fighting over the same bones isn't fun. Heads up though, Wiggle 2 doesn't clean up after itself when you turn it off while Blender is open (it leaves properties pointing at stuff that doesn't exist anymore, which can crash Blender later). Emil's Wiggle removes those leftovers by itself, but restarting Blender once after turning Wiggle 2 off is the safest.
+If Wiggle 2 is still installed, turn it off. The panel warns you when both are on for the same scene, since two sims fighting over the same bones isn't fun. Heads up though, Wiggle 2 doesn't clean up after itself when you turn it off while Blender is open (it leaves properties pointing at stuff that doesn't exist anymore, which can crash Blender later). Emil's Wiggle removes those leftovers by itself (right when Wiggle 2 gets turned off, and again before every save, since a leftover can crash saving a file with library overrides), but restarting Blender once after turning Wiggle 2 off is still the safest.
 
 Got a file that already uses Wiggle 2? There's an **Import Wiggle 2 Settings** button. It shows up by itself when the file has Wiggle 2 bones, and it copies everything over (stiffness, colliders, head/tail, mutes...) and switches Wiggle 2 off for that scene.
 
@@ -32,7 +32,9 @@ This is the big one. F12, Ctrl+F12 and command line renders all run the wiggle f
 
 The easy way: play your animation once (or click **Simulate Range**), then render. Every simulated frame is cached, so the render just reuses them, and a single F12 on frame 87 shows exactly what you saw on frame 87. If a frame isn't cached, an animation render simulates it on the spot, frame after frame.
 
-**Lock Cache** keeps the cached frames even if you edit stuff afterwards. Simulate Range locks it for you. When the cache is unlocked, editing the animation, the rig or a collider clears it, so you never render something stale.
+Or don't even do that: leave Blender alone for 15 seconds and the **Background Cache** fills in the frames that aren't cached yet by itself (more on that in Speed stuff).
+
+**Lock Cache** keeps the cached frames even if you edit stuff afterwards. Simulate Range locks it for you. When the cache is unlocked, editing the animation, the rig or a collider, or changing the frame rate or gravity clears it, so you never render something stale.
 
 Wiggle turns on **Render > Lock Interface** when you enable a scene, and the panel yells if it gets turned off. Keep it on, it stops the viewport from touching the scene while the render thread moves bones.
 
@@ -44,7 +46,13 @@ Wiggle turns on **Render > Lock Interface** when you enable a scene, and the pan
 
 ### Speed stuff
 
-**Fast Preview** (on by default) is for viewport playback. It shows each frame's wiggle one frame late, and in exchange Blender only has to evaluate your scene once per frame instead of twice. The physics itself is still exact, and paused frames, scrubbing to cached frames and renders are always exact too. You won't notice the delay on ears and hair, honestly. If a rig can't do it (other constraints on the wiggle chain, bones that don't inherit rotation or scale fully), it just quietly uses the normal mode.
+**Fast Preview** (on by default) is for viewport playback. It shows each frame's wiggle one frame late, and in exchange Blender only has to evaluate your scene once per frame instead of twice. The physics itself is still exact, and paused frames, scrubbing to cached frames and renders are always exact too. You won't notice the delay on ears and hair, honestly. If a rig can't do it (other constraints on the wiggle chain, bones that don't inherit rotation or scale fully), it uses the normal mode, and the Simulation & Cache panel tells you which bone is the reason.
+
+Careful, **Fast Preview doesn't change the physics time** in the Debug panel, that number is only the Python physics. What it saves is Blender evaluating your whole scene a second time, which is the expensive part when heavy meshes follow the rig (hello Auto Smooth). The Debug panel shows the actual playback fps too, that's the one to look at.
+
+**Slow playback** is fine now too. When Blender can't keep up it skips frames, and the wiggle used to start over every time it skipped more than 4. Now it keeps going through the skipped frames (a bit approximated, so those frames never replace exact ones in the cache, and a render or a normal replay simulates them properly). Same thing for renders with a Frame Step.
+
+**Background Cache** (on by default, Preferences > Add-ons > Emil's Wiggle, or the toggle in the cache box) kicks in when you haven't touched anything for 15 seconds. It simulates the frames of the playback range that aren't cached yet, exactly like playing from the start would, so play and render are instant afterwards. It never moves your timeline or your viewport, it works in tiny slices (a third of one core at most) and it stops the moment you do anything. It can't get a whole core to itself though, Blender only lets its main thread evaluate a scene. It waits while something plays or renders, while you're in Edit or Paint mode, and while a viewport is in Rendered shading. If it can't do a rig exactly (a collider that follows a wiggle bone, a driver that reads the scene, a geometry nodes collider...), it leaves that rig to playback and the cache box says why.
 
 **Substeps** splits each frame into smaller physics steps. Useful for very stiff springs or fast motion, costs a bit more.
 
@@ -94,6 +102,19 @@ flowchart TD
     I --> J[Blender evaluates the wiggled bones again]
 ```
 
+The Background Cache doesn't touch your scene at all. It has its own hidden scene (".EmilsWiggle Cache", names starting with a dot don't show up in the scene list, and it's removed before every save) with copies of the rigs that share their armature and animation, minus our constraint, plus the colliders. Blender only evaluates what those copies need, so the heavy meshes are left out, and that scene's depsgraph is never made active, so nothing leaks back into your objects. Its frames come out identical to the ones playing from the start gives, to the last bit.
+
+```mermaid
+flowchart LR
+    A[15 s without activity] --> B[Copy the rigs into the hidden scene]
+    B --> C[Wait for the viewport to be quiet]
+    C --> D[Evaluate one frame of the copies]
+    D --> E[Simulate it in 8 ms slices]
+    E --> F[Store it in the real cache]
+    F --> D
+    G[Anything happens] -.-> H[Stop and remove the copies]
+```
+
 The same code runs in the viewport and on the render thread, it only ever uses the scene and depsgraph Blender hands to the handlers. Anything that isn't Blender's main thread (F12 and Ctrl+F12, Alembic and USD exports running in the background, other scenes the compositor renders) only reads and moves empties, it never creates or deletes anything.
 
 One more rule that cost me a crash: frame_change_pre never creates empties or constraints either. When you switch scenes (or make a New Scene > Full Copy), Blender builds the new scene's depsgraph, calls frame_change_pre, then builds it again without evaluating in between, and 3.6 dies in that second build if something got added. So new rigs get their empties in frame_change_post, or from a timer right after an edit.
@@ -104,6 +125,7 @@ The code is split up like this:
 |---|---|
 | `solver.py` | The physics (springs, stretch, chains, collisions, pins, per axis, locks) |
 | `runtime.py` | Rigs, the frame logic, the cache, the constraints and empties |
+| `background.py` | The Background Cache and its hidden scene |
 | `props.py` | Every setting, saved in the .blend and library overridable |
 | `handlers.py` | Blender app handlers |
 | `operators.py` | Buttons: reset, simulate, bake, copy, select, import |
@@ -113,7 +135,7 @@ The code is split up like this:
 
 ## When something acts weird
 
-Turn on **Developer Tools** in Preferences > Add-ons > Emil's Wiggle. A **Debug** panel shows up at the bottom, with counters and a **Copy Debug Report** button. The report has the settings of every wiggle bone, what the last frames did (cache, sim, fast preview, render...) and the last error, so paste that along with what you saw.
+Turn on **Developer Tools** in Preferences > Add-ons > Emil's Wiggle. A **Debug** panel shows up at the bottom, with counters (including why the cache got cleared), the playback fps and a **Copy Debug Report** button. The report has the settings of every wiggle bone, what the last frames did (cache, sim, fast preview, render...) and the last error, so paste that along with what you saw.
 
 If Blender straight up crashes, there's a **Crash Log** too (on by default, same preferences). It only writes something when Blender dies, and then it says what Python was doing at that exact moment, which Blender's own crash file usually doesn't. It lives at `%TEMP%\emils_wiggle_crash.log`, and the Debug panel has a button to open it.
 
@@ -127,11 +149,11 @@ Two suites, both run with one command (plain Python, it finds Blender 3.6 by its
 python tests/run_all.py
 ```
 
-The background one builds rigs, plays them, renders with Cycles and Workbench, saves and reloads, bakes and draws every panel (104 passed last run on Blender 3.6.23). Background mode can't do real playback or threaded renders though, so the second one opens its own little Blender window, plays, stops, does a Ctrl+F12 with and without the cache plus an F12, copies and switches scenes, exports an Alembic in the background, checks everything and closes itself (23 passed). `--headless` or `--gui` runs just one of them, `-v` shows every check.
+The background one builds rigs, plays them, renders with Cycles and Workbench, saves and reloads, bakes and draws every panel (134 passed last run on Blender 3.6.23). Background mode can't do real playback or threaded renders though, so the second one opens its own little Blender window, plays, stops, does a Ctrl+F12 with and without the cache plus an F12, copies and switches scenes, exports an Alembic in the background, sits still to let the Background Cache work, plays with frames dropping, checks everything and closes itself (33 passed). `--headless` or `--gui` runs just one of them, `-v` shows every check.
 
 Every bug that gets fixed gets its own test in there too, so it can't sneak back in.
 
-Then there's the mean one, `python tests/run_all.py --stress`. It throws hundreds of random things at Blender with the add-on on: new and deleted rigs, renames, edit mode changes, crazy settings (zero scale, huge stiffness...), deleting colliders or even our own empties, scene copies, renders with motion blur or another scene in the compositor, Alembic and USD exports, linked and overridden rigs, rigs parented to other rigs, reloading the file or File > New, turning the add-on off and on, and in the GUI version also undo, redo, viewport renders and editing while the animation plays. It also flags any single action that takes more than 5 seconds. Every action gets logged before it runs, so if something ever crashes the log says exactly what did it. `--seeds` and `--ops` make it longer.
+Then there's the mean one, `python tests/run_all.py --stress`. It throws hundreds of random things at Blender with the add-on on: new and deleted rigs, renames, edit mode changes, crazy settings (zero scale, huge stiffness...), deleting colliders or even our own empties, scene copies, renders with motion blur or another scene in the compositor, Alembic and USD exports, linked and overridden rigs, rigs parented to other rigs, reloading the file or File > New, turning the add-on off and on, and in the GUI version also undo, redo, viewport renders and editing while the animation plays. The Background Cache runs between the actions the whole time. It also flags any single action that takes more than 5 seconds. Every action gets logged before it runs, so if something ever crashes the log says exactly what did it. `--seeds` and `--ops` make it longer.
 
 `python tools/build_zip.py` makes the installable zip in `../dist`.
 
@@ -142,6 +164,7 @@ Then there's the mean one, `python tests/run_all.py --stress`. It throws hundred
 - A rig in a scene that was never shown in the viewport renders without wiggle if you render it straight away, since nothing can be created during a render (a compositor node pulling in another scene, for example). Look at that scene once first.
 - Linked armatures need a library override (Blender won't let anything add constraints otherwise).
 - Fast Preview is viewport playback only, on purpose.
+- Colliders keep colliding when you hide or exclude them, the settings point at them so Blender keeps them around. Clear the collider field to turn a collision off.
 
 ## Credits
 

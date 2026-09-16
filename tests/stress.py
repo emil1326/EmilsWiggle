@@ -34,11 +34,20 @@ import bpy  # noqa: E402
 from mathutils import Vector  # noqa: E402
 
 import EmilsWiggle  # noqa: E402
-from EmilsWiggle import handlers, runtime  # noqa: E402
+from EmilsWiggle import background, handlers, runtime  # noqa: E402
 
+if os.environ.get("EMILS_WIGGLE_STRESS_NO_HANDLERS"):
+    handlers.register = lambda: None  # repro helper: is it us or Blender?
 EmilsWiggle.register()
 
 GUI = not bpy.app.background
+# the background cache kicks in between actions as often as possible
+background.force_enabled = True
+background.delay_override = 0.15
+background.WARMUP_QUIET = 0.05
+background.POLL = 0.05
+if os.environ.get("EMILS_WIGGLE_STRESS_NO_SAVE_CLEANUP"):
+    background.remove_all = lambda: None  # repro helper: leave the hidden scene alone when saving
 rng = random.Random(SEED)
 TMP = tempfile.mkdtemp(prefix="emils_wiggle_stress_")
 stats = {"ops": 0, "op_errors": 0, "renders": 0, "undos": 0, "reloads": 0}
@@ -504,7 +513,8 @@ def act_scenes():
     elif len(scenes()) > 1:
         target = pick(scenes())
         if GUI and rng.random() < 0.5:
-            bpy.context.window_manager.windows[0].scene = target
+            if background.SCENE_TAG not in target:  # nobody switches to the hidden scene by hand
+                bpy.context.window_manager.windows[0].scene = target
         elif target != cur_scene():
             bpy.data.scenes.remove(target)
 
@@ -624,6 +634,19 @@ def act_library():
             ob.override_create(remap_local_usages=True)
 
 
+def act_background():
+    """Headless: a background cache session, sometimes cut short like when the user comes back."""
+    if GUI:
+        return
+    background.run_blocking(cur_scene(), limit=rng.choice([None, 1, 5, 40]))
+
+
+def act_sit_still():
+    """GUI: don't touch anything for a moment, the background cache starts (and gets interrupted)."""
+    if GUI:
+        return "idle"
+
+
 def act_view_layer_switch():
     if not GUI:
         return
@@ -701,6 +724,11 @@ def act_wiggle2_leftovers():
         if owner == "Scene":
             cur_scene().wiggle.x = 1.0
         bpy.utils.unregister_class(cls)
+    if not GUI:
+        # A real Wiggle 2 gets cleaned up the moment it's turned off (legacy.hook_wiggle2), and the
+        # GUI has the timer for anything else. Background Blender runs no timers, so do it here.
+        from EmilsWiggle import legacy
+        legacy.clean_dangling_wiggle2()
 
 
 def act_mode_switch():
@@ -721,6 +749,7 @@ ACTIONS = [
     (act_view_layers, 2), (act_scenes, 2), (act_render, 3), (act_reload, 1), (act_addon_toggle, 1),
     (act_wiggle2_leftovers, 1), (act_mode_switch, 3), (act_export, 1), (act_parent_rig, 2),
     (act_library, 1), (act_viewport_render, 1 if GUI else 0), (act_view_layer_switch, 1 if GUI else 0),
+    (act_background, 0 if GUI else 3), (act_sit_still, 6 if GUI else 0),
     (act_undo, 6 if GUI else 0), (act_undo_push, 4 if GUI else 0), (act_playback, 6 if GUI else 0),
 ]
 WEIGHTS = [w for _a, w in ACTIONS]
@@ -733,7 +762,12 @@ def check_invariants(label):
         for ob in scene.objects:
             if runtime.HELPER_TAG in ob:
                 problem(f"{label}: helper {ob.name} ended up in scene {scene.name}")
+    hidden = background.cache_scene()
+    if GUI and hidden is not None and any(w.scene == hidden for w in bpy.context.window_manager.windows):
+        problem(f"{label}: the background cache's scene is shown in a window")
     for ob in bpy.data.objects:
+        if background.COPY_TAG in ob and any(sc != hidden for sc in ob.users_scene):
+            problem(f"{label}: background copy {ob.name} is in {[s.name for s in ob.users_scene]}")
         if runtime.HELPER_TAG in ob:
             vals = list(ob.location) + list(ob.rotation_quaternion) + list(ob.scale)
             if not all(math.isfinite(v) for v in vals):
@@ -797,7 +831,9 @@ def run_one(i):
 
 def finish():
     lines = [f"Blender {bpy.app.version_string} | {'GUI' if GUI else 'background'} | seed {SEED}",
-             f"stats: {stats}"]
+             f"stats: {stats}", f"background cache: {background.stats}"]
+    if background.last_error:
+        problems.append("background cache error: " + background.last_error.strip()[-400:])
     for text in problems:
         lines.append("FAIL  " + text)
     lines.append(f"PASS  survived {stats['ops']} random actions" if not problems
@@ -833,6 +869,8 @@ if GUI:
             result = run_one(state["i"])
             if result == "wait_render":
                 return 0.5
+            if result == "idle":
+                return rng.uniform(0.2, 2.5)
             return 0.02 if rng.random() < 0.8 else 0.3  # sometimes let playback/redraws happen
         except Exception:
             problem("stress driver crashed: " + traceback.format_exc()[-500:])

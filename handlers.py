@@ -10,7 +10,7 @@ import traceback
 import bpy
 from bpy.app.handlers import persistent
 
-from . import runtime
+from . import background, legacy, runtime
 
 error_count = 0
 
@@ -28,6 +28,7 @@ def _safe(fn, *args):
 
 @persistent
 def emils_wiggle_frame_pre(scene, depsgraph=None):
+    background.note_activity(scene, "frame change")
     _safe(runtime.frame_pre, scene)
 
 
@@ -39,38 +40,56 @@ def emils_wiggle_frame_post(scene, depsgraph=None):
 @persistent
 def emils_wiggle_depsgraph_post(scene, depsgraph=None):
     if depsgraph is not None:
+        _safe(background.note_depsgraph, scene, depsgraph)
+    if depsgraph is not None:
         _safe(runtime.on_depsgraph_update, scene, depsgraph)
 
 
 @persistent
 def emils_wiggle_load_pre(*_args):
     # the old file's objects are about to be freed, drop every reference to them now
+    background.drop()
     runtime.clear_all()
 
 
 @persistent
 def emils_wiggle_load_post(*_args):
+    _safe(legacy.clean_dangling_wiggle2)
     runtime.clear_all()
+    background.note_activity(source="file")
     _safe(runtime.detect_legacy)
 
 
 @persistent
+def emils_wiggle_save_pre(*_args):
+    # Wiggle 2 leftovers make saving a file with library overrides crash
+    _safe(legacy.clean_dangling_wiggle2)
+    # the background cache's hidden scene never goes into the file
+    _safe(background.remove_all)
+
+
+@persistent
 def emils_wiggle_undo_post(*_args):
+    background.drop()
+    background.note_activity(source="undo")
     _safe(runtime.after_undo)
 
 
 @persistent
 def emils_wiggle_render_init(scene, *_args):
+    background.note_activity(source="render")
     _safe(runtime.render_started, scene)
 
 
 @persistent
 def emils_wiggle_playback_post(scene, *_args):
+    background.note_activity(source="playback")
     _safe(runtime.playback_stopped, scene)
 
 
 @persistent
 def emils_wiggle_render_done(scene, *_args):
+    background.note_activity(source="render")
     _safe(runtime.render_finished, scene)
 
 
@@ -80,6 +99,7 @@ _HANDLERS = (
     ("depsgraph_update_post", emils_wiggle_depsgraph_post),
     ("load_pre", emils_wiggle_load_pre),
     ("load_post", emils_wiggle_load_post),
+    ("save_pre", emils_wiggle_save_pre),
     ("undo_post", emils_wiggle_undo_post),
     ("redo_post", emils_wiggle_undo_post),
     ("render_init", emils_wiggle_render_init),

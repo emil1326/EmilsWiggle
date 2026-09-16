@@ -239,6 +239,103 @@ def steps():
     check("and it didn't create anything from the render thread",
           sum(1 for o in bpy.data.objects if runtime.HELPER_TAG in o) == 3)
 
+    # --- background cache: sit still for a moment and the range fills up by itself
+    from EmilsWiggle import background
+    here = bpy.context.scene
+    rt2 = runtime.get(here)
+    runtime.invalidate_scene(here, force=True)
+    here.frame_set(5)
+    yield 0.3
+    before = dict(background.stats)
+    background.delay_override = 1.0
+    background.force_enabled = True
+    t0 = time.time()
+    while time.time() - t0 < 40 and runtime.cache_info(here)[0] < 24:
+        yield 0.25
+    count = runtime.cache_info(here)[0]
+    check("sitting still fills the cache in the background", count == 24,
+          f"{count} frames in {time.time() - t0:.1f}s, {background.stats}, {background.status(here)!r}"
+          f" same runtime {runtime.peek(here) is rt2}, {dict(rt2.counts)},"
+          f" {[(r.name, len(r.cache), r.cache_gen, r.bg_done, r.bg_reason) for r in rt2.rigs.values()]}"
+          f" {background.last_error.strip()[-300:]}")
+    check("its own work never counted as activity", background.stats["interrupted"] == before["interrupted"],
+          f"{before} -> {background.stats}")
+    yield 1.5
+    sc = background.cache_scene()
+    check("it tidies up after itself", background._session is None and sc is not None and len(sc.objects) == 0
+          and not any(background.COPY_TAG in o for o in bpy.data.objects))
+    rt2.counts.clear()
+    worst = 0.0
+    for f in range(1, 25):
+        here.frame_set(f)
+        worst = max(worst, mdiff(helper_mat("w2"), ref[f]))
+    check("the background frames are exactly what the viewport simulates",
+          worst < 1e-4 and rt2.counts.get("CACHE", 0) == 24 and not rt2.counts.get("SIM"),
+          f"{worst:.2e} {dict(rt2.counts)}")
+
+    # an edit on the rig marks it for a rebuild that normally waits for the next frame change,
+    # the background cache has to get past that by itself
+    root_pb = bpy.data.objects["Rig"].pose.bones["root"]
+    root_pb.rotation_quaternion = (1.0, 0.08, 0.0, 0.0)
+    yield 0.5
+    t0 = time.time()
+    while time.time() - t0 < 40 and runtime.cache_info(here)[0] < 24:
+        yield 0.25
+    count = runtime.cache_info(here)[0]
+    check("after editing the rig it still fills the cache by itself", count == 24,
+          f"{count} frames in {time.time() - t0:.1f}s, dirty {rt2.structure_dirty}, {background.stats},"
+          f" {dict(rt2.counts)}")
+    root_pb.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+    yield 0.3
+
+    # doing anything stops it right away (a long range, so there's time to catch it working)
+    here.frame_end = 2000
+    runtime.invalidate_scene(here, force=True)
+    here.frame_set(5)
+    t0 = time.time()
+    while time.time() - t0 < 20 and not (background._session is not None and background._session.gen is not None):
+        yield 0.05
+    running = background._session is not None
+    here.frame_set(7)
+    yield 0.8
+    check("doing something stops it right away", running and background._session is None
+          and not any(background.COPY_TAG in o for o in bpy.data.objects),
+          f"was running {running}, {background.stats}")
+    background.force_enabled = False
+    here.frame_end = 24
+
+    # saving never writes the hidden here
+    bpy.ops.wm.save_as_mainfile(filepath=os.path.join(OUT, "with_background.blend"), copy=True)
+    check("saving removes the hidden here", background.cache_scene() is None)
+
+    # --- slow playback drops frames: the wiggle goes on instead of starting over every few frames
+    here.frame_end = 200
+    sync = here.sync_mode
+    here.sync_mode = "FRAME_DROP"
+    runtime.invalidate_scene(here, force=True)
+    here.frame_set(1)
+
+    def slow(sc, *_args):
+        time.sleep(0.3)
+    bpy.app.handlers.frame_change_post.append(slow)
+    rt2.counts.clear()
+    try:
+        with bpy.context.temp_override(**ctx()):
+            bpy.ops.screen.animation_play()
+        t0 = time.time()
+        while time.time() - t0 < 2.5:
+            yield 0.1
+        with bpy.context.temp_override(**ctx()):
+            bpy.ops.screen.animation_cancel(restore_frame=False)
+    finally:
+        bpy.app.handlers.frame_change_post.remove(slow)
+    yield 0.3
+    check("slow playback drops frames", rt2.counts.get("dropped frames", 0) >= 10, f"{dict(rt2.counts)}")
+    check("and the wiggle keeps going instead of starting over", not rt2.counts.get("RESET"), f"{dict(rt2.counts)}")
+    check("the playback speed shows up in the debug numbers", 200 < rt2.frame_ms < 2000, f"{rt2.frame_ms:.0f} ms")
+    here.frame_end = 24
+    here.sync_mode = sync
+
     # --- New Scene > Full Copy: the window switches to a scene whose depsgraph was built but never
     # evaluated, then the frame handlers run. The copied rig needs its own empties, and making them
     # in frame_change_pre crashed Blender 3.6 in the depsgraph rebuild right after.

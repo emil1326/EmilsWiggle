@@ -7,8 +7,10 @@ Blender runs and those properties point at freed types: anything that walks them
 later (resolving a property path for the Info log, for example) can crash Blender.
 
 Wiggle 2's unregister() gets wrapped so the leftovers go away in the same call,
-before Blender draws anything. A slow timer is the backup (and wraps a Wiggle 2
-that gets enabled or reloaded later).
+before Blender draws anything. They also go when Emil's Wiggle gets enabled, before
+every save (saving a file with library overrides walks every property, and a dangling
+one crashed Blender in the stress test) and after loading a file. A slow timer is the
+backup (and wraps a Wiggle 2 that gets enabled or reloaded later).
 """
 
 import sys
@@ -93,6 +95,7 @@ def _watch():
 
 def register():
     try:
+        clean_dangling_wiggle2()
         hook_wiggle2()
     except Exception:
         pass

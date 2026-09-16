@@ -20,7 +20,7 @@ class Side:
     __slots__ = (
         "mass", "stiff", "stretch", "damp", "gravity",
         "per_axis", "stiff_axis", "damp_axis", "gravity_axis", "lock",
-        "wind_ob", "wind", "colliders", "radius", "friction", "bounce", "sticky", "chain",
+        "wind_ob", "wind", "colliders", "collection", "radius", "friction", "bounce", "sticky", "chain",
     )
 
 
@@ -59,6 +59,13 @@ class World:
         self.colliders = {}
         self.winds = {}
         self.depsgraph = depsgraph
+
+    def scaled(self, factor):
+        """Same world with longer steps, for frames dropped during slow playback."""
+        w = World(self.dt * factor, self.iterations, self.gravity, self.depsgraph)
+        w.colliders = self.colliders
+        w.winds = self.winds
+        return w
 
     def closest(self, c, pos):
         if c.broken:
@@ -499,18 +506,42 @@ def reset(bones):
         update_matrix(b)
 
 
-def step(bones, world):
-    """One physics step of world.dt seconds."""
+def _run(gen):
+    """Run a generator from this module to the end, returns its return value."""
+    try:
+        while True:
+            next(gen)
+    except StopIteration as done:
+        return done.value
+
+
+def step_iter(bones, world, chunk=0):
+    """One physics step of world.dt seconds.
+
+    With chunk > 0 it pauses (yields) every `chunk` bone updates, so the background
+    cache can spread one step over several short slices. Same math either way.
+    """
     zero = Vector()
+    left = chunk
     for b in bones:
         b.cn = zero.copy()
         b.hcn = zero.copy()
         move(b, world)
+        if chunk:
+            left -= 1
+            if left <= 0:
+                left = chunk
+                yield
     n = world.iterations
     for it in range(n):
         idx = n - 1 - it
         for b in bones:
             constrain(b, idx, world)
+            if chunk:
+                left -= 1
+                if left <= 0:
+                    left = chunk
+                    yield
     for b in bones:
         update_matrix(b)
     for b in bones:
@@ -526,11 +557,32 @@ def step(bones, world):
         b.hpos_last = b.hpos.copy()
 
 
-def simulate(bones, world, steps):
-    """Run `steps` steps, sliding the evaluated pose from pw_prev to pw."""
+def step(bones, world):
+    _run(step_iter(bones, world))
+
+
+def simulate_iter(bones, world, steps, chunk=0, scale=1.0):
+    """Run `steps` steps, sliding the evaluated pose from pw_prev to pw.
+
+    scale > 1 makes every step last longer (dt * scale). Velocities are a distance per
+    step here, so they get stretched to the longer step first and back at the end.
+    """
+    if scale != 1.0:
+        world = world.scaled(scale)
+        for b in bones:
+            b.vel = b.vel * scale
+            b.hvel = b.hvel * scale
     for k in range(1, steps + 1):
         prepare_view(bones, k / steps)
-        step(bones, world)
+        yield from step_iter(bones, world, chunk)
+    if scale != 1.0:
+        for b in bones:
+            b.vel = b.vel / scale
+            b.hvel = b.hvel / scale
+
+
+def simulate(bones, world, steps, scale=1.0):
+    _run(simulate_iter(bones, world, steps, 0, scale))
 
 
 SETTLE_WINDOW = 10
@@ -546,7 +598,7 @@ def _still(bones, ref):
     return True
 
 
-def settle(bones, world, steps):
+def settle_iter(bones, world, steps, chunk=0):
     """Preroll: simulate with the pose held still. Returns how many steps it took.
 
     Nothing changes between steps but the bones themselves, so once they stop moving
@@ -555,12 +607,16 @@ def settle(bones, world, steps):
     prepare_view(bones, 1.0)
     ref = None
     for i in range(steps):
-        step(bones, world)
+        yield from step_iter(bones, world, chunk)
         if (i + 1) % SETTLE_WINDOW == 0:
             if ref is not None and _still(bones, ref):
                 return i + 1
             ref = [(b.pos.copy(), b.hpos.copy()) for b in bones]
     return steps
+
+
+def settle(bones, world, steps):
+    return _run(settle_iter(bones, world, steps))
 
 
 # ---------------------------------------------------------------- snapshots

@@ -6,6 +6,7 @@ Headless tests for Emil's Wiggle. Run with Blender 3.6:
 Results (and any traceback) are written to <result.txt>.
 """
 
+import math
 import os
 import sys
 import tempfile
@@ -835,6 +836,51 @@ def test_caches_and_updates():
           "Plane" in rt.rigs["Rig"].colliders and runtime.cache_info(scene)[0] <= 2,
           f"{sorted(rt.rigs['Rig'].colliders)} {runtime.cache_info(scene)}")
 
+    # what does and doesn't make the cache stale
+    def cached_after(edit):
+        play(scene, ob, range(1, 11))
+        edit()
+        bpy.context.evaluated_depsgraph_get()
+        return runtime.cache_info(scene)[0]
+
+    def delete_unrelated():
+        junk = bpy.data.objects.new("Junk", None)
+        scene.collection.objects.link(junk)
+        bpy.context.evaluated_depsgraph_get()
+        bpy.data.objects.remove(junk)  # Blender tags every collection when an object goes away
+    check("deleting an unrelated object keeps the cache", cached_after(delete_unrelated) >= 10)
+
+    def other_fps():
+        scene.render.fps = 24
+    check("another frame rate clears the cache", cached_after(other_fps) == 0)
+    scene.render.fps = 30
+
+    def more_gravity():
+        scene.use_gravity = True
+        scene.gravity = (0.0, 0.0, -20.0)
+    check("another gravity clears the cache", cached_after(more_gravity) == 0)
+    scene.use_gravity = False
+
+    if scene.collection.objects.get(far.name) == far:
+        scene.collection.objects.unlink(far)  # only in the collider collection from now on
+        bpy.context.evaluated_depsgraph_get()
+
+    def hide_colliders():
+        bpy.context.view_layer.layer_collection.children["Colliders"].exclude = True
+    # the wiggle settings point at the colliders, so Blender keeps evaluating them and they keep colliding
+    left = cached_after(hide_colliders)
+    check("excluding the collider collection changes nothing, so the cache stays", left >= 10, f"{left}")
+    bpy.context.view_layer.layer_collection.children["Colliders"].exclude = False
+
+    from EmilsWiggle import background
+    runtime.invalidate_scene(scene, force=True)
+    scene.frame_set(3)
+    background.run_blocking(scene)
+    bpy.context.evaluated_depsgraph_get()  # Blender's reaction to the copies coming and going
+    count = runtime.cache_info(scene)[0]
+    check("the background cache coming and going doesn't clear what it made", count == 60, f"{count}")
+    background.remove_all()
+
     from EmilsWiggle import legacy
     Scene = bpy.types.Scene
 
@@ -877,6 +923,13 @@ def test_caches_and_updates():
         check("and the hook comes off again", fake.unregister is fake_unregister)
     finally:
         del sys.modules["fake_wiggle_2"]
+
+    # leftovers that slipped past the hook are gone before every save (they crashed a save with overrides)
+    fake_register()
+    bpy.utils.unregister_class(WiggleObject)
+    check("a dangling Wiggle 2 property is there", "wiggle" in bpy.types.Object.bl_rna.properties)
+    bpy.ops.wm.save_as_mainfile(filepath=os.path.join(tempfile.mkdtemp(), "leftovers.blend"), copy=True)
+    check("saving removes Wiggle 2 leftovers first", "wiggle" not in bpy.types.Object.bl_rna.properties)
 
 
 def test_render_details():
@@ -1125,6 +1178,222 @@ def test_linked_and_overridden_rigs():
     check("the local look-alike is still there", bpy.data.objects.get("EmilsWiggle_Rig_w0") is not None)
 
 
+def _entry_diff(a, b):
+    """Largest difference between two cache entries (wiggle offset and tail position of every bone)."""
+    worst = 0.0
+    for name, snap in a[1].items():
+        other = b[1][name]
+        worst = max(worst, _mdiff(snap[runtime.DELTA], other[runtime.DELTA]), (snap[1] - other[1]).length)
+    return worst
+
+
+def _plane(name, size, z):
+    me = bpy.data.meshes.new(name)
+    me.from_pydata([(-size, -size, z), (size, -size, z), (size, size, z), (-size, size, z)], [], [(0, 1, 2, 3)])
+    ob = bpy.data.objects.new(name, me)
+    bpy.context.scene.collection.objects.link(ob)
+    return ob
+
+
+def test_background_cache():
+    from EmilsWiggle import background
+    scene = fresh_scene()
+    scene.use_gravity = True
+    scene.frame_end = 40
+    s = scene.emils_wiggle
+    s.substeps, s.preroll = 2, 5
+    mover = bpy.data.objects.new("Mover", None)
+    scene.collection.objects.link(mover)
+    mover.keyframe_insert("location", frame=1)
+    mover.location.x = 1.5
+    mover.keyframe_insert("location", frame=30)
+    ob = make_chain("Rig")
+    ob.parent = mover
+    floor = _plane("Floor", 3.0, 2.2)
+    wind = bpy.data.objects.new("Wind", None)
+    scene.collection.objects.link(wind)
+    with bpy.context.temp_override(active_object=wind, object=wind):
+        bpy.ops.object.forcefield_toggle()
+    wind.field.type = "WIND"
+    wind.field.strength = 20.0
+    wind.rotation_euler = (1.2, 0.0, 0.4)
+    s.enabled = True
+    enable(ob, stiff=80.0, damp=2.0, gravity=1.0, collider_type="Object", collider=floor, radius=0.2,
+           wind_ob=wind, wind=1.0)
+    w1 = ob.pose.bones["w1"].emils_wiggle.tail
+    w1.stiff = 50.0
+    ob.keyframe_insert('pose.bones["w1"].emils_wiggle.tail.stiff', frame=1)
+    w1.stiff = 400.0
+    ob.keyframe_insert('pose.bones["w1"].emils_wiggle.tail.stiff', frame=30)
+
+    # the reference: playing the range from the start
+    rt = runtime.get(scene)
+    play(scene, ob, range(1, 41))
+    rig = rt.rigs["Rig"]
+    ref = dict(rig.cache)
+    check("the reference collides and blows in the wind", rig.colliders == {"Floor"} and rig.winds == {"Wind"},
+          f"{rig.colliders} {rig.winds}")
+
+    # forget it and sit somewhere in the middle, like after an edit
+    runtime.invalidate_scene(scene, force=True)
+    scene.frame_set(25)
+    helpers = {n: helper_mat(ob, n) for n in ("w0", "w1", "w2")}
+    places = {o.name: o.matrix_world.copy() for o in (mover, floor, wind, ob)}
+    done = background.run_blocking(scene)
+    key = runtime.reset_key(1, s)
+    filled = sorted(f for f, e in rig.cache.items() if e[0] == key and not e[2])
+    check("the background cache fills the whole range", done == 40 and filled == list(range(1, 41)),
+          f"{done} frames, {len(filled)} with the playback key, reason '{rig.bg_reason}'")
+    worst = max((_entry_diff(rig.cache[f], ref[f]) for f in range(1, 41) if f in rig.cache), default=1.0)
+    check("background frames == playing from the start", worst < 1e-4, f"{worst:.2e}")
+    check("nothing real moved while it worked",
+          all(_mdiff(helper_mat(ob, n), m) < 1e-9 for n, m in helpers.items())
+          and all(_mdiff(o.matrix_world, places[o.name]) < 1e-9 for o in (mover, floor, wind, ob)))
+    sc = background.cache_scene()
+    check("the hidden scene is left empty and hidden from the scene list",
+          sc is not None and sc.name.startswith(".") and len(sc.objects) == 0
+          and not any(background.COPY_TAG in o for o in bpy.data.objects))
+    rt.counts.clear()
+    again = play(scene, ob, range(1, 41))
+    check("playing afterwards only reads the cache", not rt.counts.get("SIM") and not rt.counts.get("RESET"),
+          f"{dict(rt.counts)}")
+
+    # it picks up where the cache stops
+    for f in range(21, 41):
+        del rig.cache[f]
+    rig.bg_done = None
+    done = background.run_blocking(scene)
+    worst = max(_entry_diff(rig.cache[f], ref[f]) for f in range(21, 41))
+    check("it carries on from the last cached frame", done == 20 and worst < 1e-4, f"{done} frames, {worst:.2e}")
+    check("the viewport still shows the same wiggle", max_diff(play(scene, ob, range(1, 41)), again) < 1e-6)
+
+    # a collider that rides a wiggle bone would differ in the hidden scene, so it's skipped
+    floor.parent = ob
+    floor.parent_type = "BONE"
+    floor.parent_bone = "w0"
+    runtime.invalidate_scene(scene, force=True)
+    scene.frame_set(3)
+    bpy.context.evaluated_depsgraph_get()  # the edit gets noticed...
+    scene.frame_set(4)  # ...and the next frame reads the settings again
+    done = background.run_blocking(scene)
+    check("a collider riding a wiggle bone makes it skip that rig",
+          done == 0 and "moves with wiggling bones" in rig.bg_reason, f"{done} '{rig.bg_reason}'")
+    check("and the panel says why", "Floor" in background.status(scene), background.status(scene))
+    floor.parent = None
+
+    # a driver reading the real scene would read another frame than the hidden scene evaluates
+    fc = ob.pose.bones["root"].driver_add("rotation_quaternion", 1)
+    var = fc.driver.variables.new()
+    var.type = "SINGLE_PROP"
+    var.targets[0].id_type = "SCENE"
+    var.targets[0].id = scene
+    var.targets[0].data_path = "frame_current"
+    fc.driver.expression = var.name + " * 0.001"
+    runtime.invalidate_scene(scene, force=True)
+    scene.frame_set(5)
+    done = background.run_blocking(scene)
+    check("a driver reading the scene makes it skip that rig", done == 0 and "scene" in rig.bg_reason,
+          f"{done} '{rig.bg_reason}'")
+    ob.pose.bones["root"].driver_remove("rotation_quaternion", 1)
+
+    background.remove_all()
+    check("saving removes the hidden scene", background.cache_scene() is None)
+
+
+def test_dropped_frames():
+    scene = fresh_scene()
+    scene.frame_end = 60
+    ob = make_chain("Rig")
+    s = scene.emils_wiggle
+    s.loop = False
+    s.enabled = True
+    enable(ob)
+    rt = runtime.get(scene)
+    exact = play(scene, ob, range(1, 21))
+    runtime.invalidate_scene(scene, force=True)
+
+    # slow playback: every frame drawn skips a few
+    runtime.assume_playing = True
+    try:
+        scene.frame_set(1)
+        rt.counts.clear()
+        for f in (2, 3, 10, 17):
+            scene.frame_set(f)
+        rig = rt.rigs["Rig"]
+        check("dropped frames during playback don't restart the sim",
+              not rt.counts.get("RESET") and rt.counts.get("SIM") == 4, f"{dict(rt.counts)}")
+        check("frames after a skip are marked as guessed", rig.cache[10][2] and rig.cache[17][2]
+              and not rig.cache[3][2])
+        # playback loops back while still dropping frames: go on from the cached first frame
+        rt.counts.clear()
+        scene.frame_set(4)
+        check("looping with dropped frames carries on from the first frame",
+              not rt.counts.get("RESET") and rt.counts.get("SIM") == 1
+              and runtime.history[-1][2].startswith("sim, from frame 1"), f"{dict(rt.counts)} {runtime.history[-1]}")
+    finally:
+        runtime.assume_playing = None
+
+    # an exact pass replaces the guesses, and guesses never replace exact frames
+    after = play(scene, ob, range(1, 21))
+    check("exact frames replace guessed ones", not any(rig.cache[f][2] for f in range(1, 21))
+          and max_diff(after, exact) < 1e-5, f"{max_diff(after, exact):.2e}")
+    runtime.assume_playing = True
+    try:
+        scene.frame_set(1)
+        scene.frame_set(9)
+        shown = _mdiff(helper_mat(ob, "w2"), rig.cache[9][1]["w2"][runtime.DELTA])
+        check("a skip lands on the exact cached frame instead", not rig.cache[9][2] and shown < 1e-5,
+              f"approx {rig.cache[9][2]}, shown {shown:.2e}, {runtime.history[-1]}")
+    finally:
+        runtime.assume_playing = None
+
+    # Frame Step renders
+    scene.render.engine = "BLENDER_WORKBENCH"
+    scene.render.resolution_x = scene.render.resolution_y = 8
+    cam = bpy.data.objects.new("Cam", bpy.data.cameras.new("Cam"))
+    scene.collection.objects.link(cam)
+    scene.camera = cam
+    scene.frame_end = 30
+    scene.frame_step = 6
+    runtime.reset_scene(scene)
+    scene.frame_set(1)  # the render comes back to this frame at the end
+    rt.counts.clear()
+    try:
+        scene.render.filepath = os.path.join(tempfile.mkdtemp(), "step_")
+        bpy.ops.render.render(animation=True)
+    finally:
+        scene.frame_step = 1
+    check("a render with Frame Step 6 keeps simulating between frames",
+          not rt.counts.get("RESET") and rt.counts.get("SIM", 0) == 4, f"{dict(rt.counts)}")
+
+
+def test_huge_values():
+    from mathutils import Matrix
+    scene = fresh_scene()
+    ob = make_chain("Rig")
+    scene.emils_wiggle.enabled = True
+    enable(ob)
+    play(scene, ob, range(1, 4))
+    rt = runtime.get(scene)
+    rig = rt.rigs["Rig"]
+    b = rig.by_name["w2"]
+    keep = b.delta.copy()
+    # finite, but Blender's float32 decomposition turns a scale like this into inf
+    b.delta = Matrix.Diagonal((1.0, 1e20, 1.0, 1.0))
+    check("a huge wiggle offset counts as blown up", not runtime._all_finite(rig))
+    before = runtime.bad_writes
+    writer = runtime.HelperWriter()
+    b.shown = None
+    writer.show(b, b.delta)
+    writer.flush()
+    helper = runtime.find_constraint(ob.pose.bones["w2"]).target
+    values = list(helper.location) + list(helper.rotation_quaternion) + list(helper.scale)
+    check("and an empty never gets inf or nan from it", all(math.isfinite(v) for v in values)
+          and runtime.bad_writes == before + 1, f"{values}")
+    b.delta = keep
+    b.shown = None
+
+
 def _preroll_steps(rig_name):
     """(done, total) from the last "preroll x/y steps" history note of a rig."""
     for _f, name, what in reversed(runtime.history):
@@ -1240,6 +1509,9 @@ def main():
     run(test_preroll)
     run(test_threads_and_deferred_setup)
     run(test_linked_and_overridden_rigs)
+    run(test_background_cache)
+    run(test_dropped_frames)
+    run(test_huge_values)
     from EmilsWiggle import handlers
     check("no errors inside the handlers during the whole run (empty-mesh collider included)",
           handlers.error_count == 0, f"{handlers.error_count} errors, see the log")

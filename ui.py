@@ -4,7 +4,7 @@ Emil's Wiggle - sidebar panels (View3D > Sidebar > Emil).
 
 import bpy
 
-from . import debug, handlers, runtime
+from . import debug, handlers, legacy, runtime
 
 
 class EmilsWigglePanel:
@@ -23,10 +23,7 @@ def _bone_ready(context):
 
 
 def _wiggle2_active(scene):
-    try:
-        return bool(scene.wiggle_enable)
-    except AttributeError:
-        return False
+    return legacy.wiggle2_active() and bool(getattr(scene, "wiggle_enable", False))
 
 
 def draw_side(layout, context, side, is_tail):
@@ -280,6 +277,7 @@ class EMILSWIGGLE_PT_debug(EmilsWigglePanel, bpy.types.Panel):
             col.label(text=f"{handlers.error_count} errors, see the report", icon="ERROR")
         row = layout.row(align=True)
         row.operator("emils_wiggle.copy_report", icon="COPYDOWN")
+        row.operator("emils_wiggle.open_crash_log", icon="FILE_TEXT", text="")
         row.operator("emils_wiggle.reset_counters", icon="LOOP_BACK", text="")
 
 

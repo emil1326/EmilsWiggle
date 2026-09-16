@@ -21,7 +21,8 @@ How a frame goes (see README for the diagram):
   depsgraph pass 2   Blender evaluates the wiggled pose (skipped for cached frames)
 
 Only the scene/depsgraph given to the handlers are used, never bpy.context, so the
-same code runs during F12 / Ctrl+F12 renders on the render thread.
+same code runs during F12 / Ctrl+F12 renders on the render thread. Nothing gets
+created or deleted from that thread.
 """
 
 import time
@@ -39,8 +40,9 @@ HELPER_COLLECTION = "EmilsWiggle Helpers"
 MAX_SKIP = 4
 PIN_TYPES = {"DAMPED_TRACK", "TRACK_TO", "LOCKED_TRACK"}
 IDENTITY = Matrix.Identity(4)
+DELTA = 13  # index of the wiggle offset in a solver snapshot
 
-CACHE, SIM, RESET, SAME = "CACHE", "SIM", "RESET", "SAME"
+CACHE, SIM, RESET, SAME, SUB = "CACHE", "SIM", "RESET", "SAME", "SUB"
 
 _runtimes = {}
 history = deque(maxlen=60)  # (frame, rig, what happened), for the debug report
@@ -76,7 +78,7 @@ class SceneRuntime:
         self.rigs = {}
         self.structure_dirty = True
         self.object_count = -1
-        self.ignore_updates_until = 0.0
+        self.own_writes = set()  # rigs whose empties we moved outside a frame change
         self.key_counter = 0
         self.skip_static_preroll = False
         self.force_fast = False
@@ -123,10 +125,26 @@ def _close(a, b, eps=1e-6):
     return True
 
 
+def _can_edit_data(rt):
+    # Renders from the UI run on their own thread. Background renders are on the main one.
+    return not rt.rendering or bpy.app.background
+
+
 # ---------------------------------------------------------------- helper empties
 
 def _editable(ob):
-    return ob.library is None or ob.override_library is not None
+    if ob.library is None:
+        return True
+    override = ob.override_library
+    return override is not None and not getattr(override, "is_system_override", False)
+
+
+def _owner_key(ob, pb):
+    return f"{ob.name}/{pb.name}"
+
+
+def _is_helper(ob):
+    return ob is not None and HELPER_TAG in ob
 
 
 def find_constraint(pb):
@@ -134,7 +152,7 @@ def find_constraint(pb):
     if c is not None and c.type == "COPY_TRANSFORMS":
         return c
     for c in pb.constraints:
-        if c.type == "COPY_TRANSFORMS" and c.target is not None and HELPER_TAG in c.target:
+        if c.type == "COPY_TRANSFORMS" and _is_helper(c.target):
             return c
     return None
 
@@ -152,12 +170,15 @@ def ensure_helper(ob, pb, taken):
     """Make sure the bone has our constraint and its own empty. Returns the empty."""
     c = find_constraint(pb)
     helper = c.target if c is not None else None
-    if helper is not None and (HELPER_TAG not in helper or helper.as_pointer() in taken):
-        helper = None  # not ours, or shared with a duplicated rig
+    key = _owner_key(ob, pb)
+    if helper is not None and (not _is_helper(helper) or helper.get(HELPER_TAG) != key
+                               or helper.as_pointer() in taken):
+        # not ours, or it belongs to another bone (duplicated bone/rig, scene copy, rename)
+        helper = None
     if helper is None:
         helper = bpy.data.objects.new(f"EmilsWiggle_{ob.name}_{pb.name}", None)
         helper.empty_display_size = 0.05
-        helper[HELPER_TAG] = f"{ob.name}/{pb.name}"
+        helper[HELPER_TAG] = key
     if helper.rotation_mode != "QUATERNION":
         helper.rotation_mode = "QUATERNION"
     coll = helper_collection()
@@ -188,25 +209,32 @@ def ensure_helper(ob, pb, taken):
     return helper
 
 
-def remove_helper(pb):
+def existing_helper(pb):
+    """Read-only version for the render thread: whatever empty the constraint already uses."""
     c = find_constraint(pb)
-    if c is None:
-        return
-    helper = c.target
-    pb.constraints.remove(c)
-    if helper is not None and HELPER_TAG in helper:
-        bpy.data.objects.remove(helper)
+    return c.target if c is not None and _is_helper(c.target) else None
+
+
+def remove_constraint(pb):
+    """Take our constraint off a bone. The empty goes away in cleanup_orphan_helpers()."""
+    c = find_constraint(pb)
+    if c is not None:
+        pb.constraints.remove(c)
+        return True
+    return False
 
 
 def strip_object(ob):
     if ob.type != "ARMATURE" or ob.pose is None or not _editable(ob):
-        return
+        return False
+    removed = False
     for pb in ob.pose.bones:
-        if find_constraint(pb) is not None:
-            remove_helper(pb)
+        removed |= remove_constraint(pb)
+    return removed
 
 
 def cleanup_orphan_helpers():
+    """Delete empties that no constraint in the whole file points at anymore."""
     used = set()
     for ob in bpy.data.objects:
         if ob.type == "ARMATURE" and ob.pose is not None:
@@ -214,9 +242,14 @@ def cleanup_orphan_helpers():
                 for c in pb.constraints:
                     if c.type == "COPY_TRANSFORMS" and c.target is not None:
                         used.add(c.target.as_pointer())
-    for ob in list(bpy.data.objects):
-        if HELPER_TAG in ob and ob.as_pointer() not in used:
-            bpy.data.objects.remove(ob)
+    orphans = [ob for ob in bpy.data.objects if _is_helper(ob) and ob.as_pointer() not in used]
+    for ob in orphans:
+        bpy.data.objects.remove(ob)
+    if orphans:
+        # a runtime somewhere might still hold one of them
+        for rt in _runtimes.values():
+            rt.structure_dirty = True
+    return len(orphans)
 
 
 def strip_scene(scene):
@@ -244,6 +277,7 @@ class HelperWriter:
 
     A normal RNA write also pushes a UI notifier, and that queue isn't thread safe,
     which matters on the render thread. foreach_set + update_tag only tags the depsgraph.
+    Empties that aren't in the helper collection anymore are skipped, never touched.
     """
 
     def __init__(self):
@@ -257,7 +291,7 @@ class HelperWriter:
 
     def flush(self):
         if not self.jobs:
-            return
+            return 0
         coll = helper_collection(create=False)
         objects = coll.objects if coll is not None else ()
         n = len(objects)
@@ -281,7 +315,7 @@ class HelperWriter:
             loc[3 * i:3 * i + 3] = l[:]
             rot[4 * i:4 * i + 4] = r[:]
             sca[3 * i:3 * i + 3] = sc[:]
-            batched.append(b.helper)
+            batched.append(objects[i])
         if batched:
             objects.foreach_set("location", loc)
             objects.foreach_set("rotation_quaternion", rot)
@@ -289,21 +323,30 @@ class HelperWriter:
             for helper in batched:
                 helper.update_tag(refresh={"OBJECT"})
         self.jobs.clear()
+        return len(batched)
 
 
 # ---------------------------------------------------------------- structure
 
 def _rig_signature(ob):
+    """Everything a rig's structure depends on. A change means the rig gets rebuilt."""
     entries = []
     for pb in ob.pose.bones:
         s = pb.emils_wiggle
         if s.mute:
             continue
+        bone = pb.bone
         has_tail = s.use_tail
-        has_head = s.use_head and not pb.bone.use_connect
+        has_head = s.use_head and not bone.use_connect
         if has_tail or has_head:
             entries.append((pb.name, has_tail, has_head))
-    return tuple(entries)
+    if not entries:
+        return ()
+    # hierarchy and inheritance of every bone, wiggle chains depend on the in-between ones too
+    shape = tuple((pb.name, pb.parent.name if pb.parent else "", pb.bone.use_connect,
+                   pb.bone.inherit_scale, pb.bone.use_inherit_rotation, round(pb.bone.length, 6))
+                  for pb in ob.pose.bones)
+    return tuple(entries), shape
 
 
 def _depth(pb):
@@ -317,7 +360,7 @@ def _depth(pb):
 
 def _build_rig(ob, signature):
     rig = RigRuntime(ob, signature)
-    active = {name: (tail, head) for name, tail, head in signature}
+    active = {name: (tail, head) for name, tail, head in signature[0]}
     pbs = sorted((ob.pose.bones[name] for name in active), key=_depth)
     for pb in pbs:
         b = solver.BoneState(pb.name)
@@ -358,41 +401,52 @@ def _build_rig(ob, signature):
     return rig
 
 
-def _attach(ob, rig, taken):
+def _attach(ob, rig, taken, edit):
     for pb in ob.pose.bones:
         b = rig.by_name.get(pb.name)
         if b is None:
-            if find_constraint(pb) is not None:
-                remove_helper(pb)
+            if edit:
+                remove_constraint(pb)
             continue
-        helper = ensure_helper(ob, pb, taken)
-        if _ptr(b.helper) != helper.as_pointer():
+        helper = ensure_helper(ob, pb, taken) if edit else existing_helper(pb)
+        if _ptr(b.helper) != _ptr(helper):
             b.helper = helper
             b.shown = None
 
 
-def rebuild(scene, rt):
+def rebuild(scene, rt, edit=True):
+    """Match the runtime to the scene. With edit=False nothing is created or deleted."""
     old_rigs = rt.rigs
     new_rigs = {}
     taken = set()
-    if scene.emils_wiggle.enabled:
-        for ob in scene.objects:
-            if ob.type != "ARMATURE" or ob.pose is None or not _editable(ob):
-                continue
+    removed_something = False
+    enabled = scene.emils_wiggle.enabled
+    for ob in scene.objects:
+        if ob.type != "ARMATURE" or ob.pose is None:
+            continue
+        try:
             os_ = ob.emils_wiggle
-            signature = () if (os_.mute or os_.freeze) else _rig_signature(ob)
-            if not signature:
-                strip_object(ob)
+            signature = _rig_signature(ob) if enabled and not (os_.mute or os_.freeze) else ()
+            if not signature or not _editable(ob):
+                if edit and signature == ():
+                    removed_something |= strip_object(ob)
                 continue
             rig = old_rigs.get(ob.name)
             if rig is None or rig.ptr != ob.as_pointer() or rig.signature != signature:
+                if edit and rig is not None:
+                    removed_something = True  # bones may have left the rig
                 rig = _build_rig(ob, signature)
-            _attach(ob, rig, taken)
+            _attach(ob, rig, taken, edit)
+            rig.settings_dirty = True  # colliders, winds, constraints may have changed too
             new_rigs[ob.name] = rig
-    else:
-        for ob in scene.objects:
-            strip_object(ob)
-    if any(name not in new_rigs for name in old_rigs) or not scene.emils_wiggle.enabled:
+        except Exception:
+            # one broken armature (odd override, locked data...) shouldn't stop the others
+            global last_error
+            last_error = traceback.format_exc()
+            rt.counts["errors"] += 1
+            print(f"Emil's Wiggle: couldn't set up {ob.name}")
+            traceback.print_exc()
+    if edit and (removed_something or any(name not in new_rigs for name in old_rigs)):
         cleanup_orphan_helpers()
     rt.rigs = new_rigs
     rt.structure_dirty = False
@@ -431,6 +485,10 @@ def detect_settings_animated(rig, ob):
     rig.anim_dirty = False
 
 
+def _orig(idd):
+    return idd.original if idd is not None else None
+
+
 def _read_side(src, scene):
     sd = solver.Side()
     sd.mass = src.mass
@@ -443,7 +501,8 @@ def _read_side(src, scene):
     sd.damp_axis = tuple(src.damp_axis)
     sd.gravity_axis = tuple(src.gravity_axis)
     sd.lock = tuple(src.lock)
-    sd.wind_ob = src.wind_ob.name if src.wind_ob is not None else None
+    wind = _orig(src.wind_ob)
+    sd.wind_ob = wind.name if wind is not None else None
     sd.wind = src.wind
     sd.radius = src.radius
     sd.friction = src.friction
@@ -452,23 +511,29 @@ def _read_side(src, scene):
     sd.chain = src.chain
     colliders = []
     if src.collider_type == "Object":
-        c = src.collider
+        c = _orig(src.collider)
         if c is not None and c.type == "MESH" and scene.objects.get(c.name) == c:
             colliders.append(c.name)
     else:
-        coll = src.collider_collection
+        coll = _orig(src.collider_collection)
         if coll is not None and (coll == scene.collection or coll in scene.collection.children_recursive):
             colliders = [o.name for o in coll.all_objects if o.type == "MESH"]
     sd.colliders = colliders
     return sd
 
 
-def refresh_settings(scene, rig, ob):
+def refresh_settings(scene, rig, ob, ob_eval):
+    """Read the settings, from the evaluated armature so animated values are right in renders."""
     rig.colliders = set()
     rig.winds = set()
+    bones = ob.pose.bones
+    bones_eval = ob_eval.pose.bones
     for b in rig.bones:
-        pb = ob.pose.bones[b.name]
-        s = pb.emils_wiggle
+        pb = bones.get(b.name)
+        pbe = bones_eval.get(b.name)
+        if pb is None or pbe is None:
+            raise KeyError(f"bone {b.name} is gone")
+        s = pbe.emils_wiggle
         b.tail = _read_side(s.tail, scene)
         b.head = _read_side(s.head, scene)
         for side, used in ((b.tail, b.has_tail), (b.head, b.has_head)):
@@ -530,6 +595,16 @@ def frame_is_cached(scene, frame):
     if rt is None or not rt.rigs:
         return False
     return all(frame in rig.cache for rig in rt.rigs.values())
+
+
+def _store(rig, frame, s):
+    if s.cache_locked and frame in rig.cache:
+        return
+    entry = (rig.key, {b.name: solver.snapshot(b) for b in rig.bones})
+    if not s.use_cache:
+        # keep the frame before too, motion blur needs its neighbours
+        rig.cache = {f: e for f, e in rig.cache.items() if f == frame - 1}
+    rig.cache[frame] = entry
 
 
 # ---------------------------------------------------------------- callbacks from props/ops
@@ -615,14 +690,33 @@ def _decide(scene, s, rig, frame, playing):
     return (RESET, frame)
 
 
-def _validate(scene, rt):
+def _subframe_delta(rig, b, frame, t):
+    """Wiggle between two frames for motion blur, from the cache (never simulated)."""
+    def delta(f):
+        entry = rig.cache.get(f)
+        snap = entry[1].get(b.name) if entry is not None else None
+        return snap[DELTA] if snap is not None else None
+    d0, d1 = delta(frame), delta(frame + 1)
+    if d0 is not None and d1 is not None:
+        return d0.lerp(d1, t)
+    dp = delta(frame - 1)
+    if d0 is not None and dp is not None:
+        return dp.lerp(d0, 1.0 + t)  # next frame isn't known yet, carry on the motion
+    return d0 if d0 is not None else b.delta
+
+
+def _validate(scene, rt, edit):
     if rt.structure_dirty or rt.object_count != len(scene.objects):
-        rebuild(scene, rt)
+        rebuild(scene, rt, edit)
         return
     for rig in rt.rigs.values():
         ob = scene.objects.get(rig.name)
-        if ob is None or ob.as_pointer() != rig.ptr:
-            rebuild(scene, rt)
+        if ob is None or ob.as_pointer() != rig.ptr or ob.pose is None:
+            rebuild(scene, rt, edit)
+            return
+        bones = ob.pose.bones
+        if any(bones.get(b.name) is None for b in rig.bones):
+            rebuild(scene, rt, edit)  # a bone got renamed or deleted
             return
 
 
@@ -631,29 +725,37 @@ def frame_pre(scene):
     if not s.enabled:
         return
     rt = get(scene)
-    if not rt.rendering:
-        _validate(scene, rt)  # never create data from the render thread
+    rt.own_writes = set()
+    _validate(scene, rt, edit=_can_edit_data(rt))
     if not rt.rigs:
         return
     frame = scene.frame_current
+    sub = scene.frame_current_final - frame
     playing = rt.force_fast or (not rt.rendering and _is_playing())
     # Fast Preview only while the viewport plays, never for renders
     fast_allowed = s.fast_preview and playing and not rt.rendering
     writer = HelperWriter()
     for rig in rt.rigs.values():
-        if rig.anim_dirty and not rt.rendering:
+        if rig.anim_dirty and _can_edit_data(rt):
             ob = scene.objects.get(rig.name)
             if ob is not None:
                 detect_settings_animated(rig, ob)
+        rig.pre_applied.clear()
+        if sub > 1e-4 and rig.ready:
+            # motion blur step: show the wiggle in between, leave the simulation alone
+            rig.pending = (SUB, frame, sub)
+            rig.fast = False
+            for b in rig.bones:
+                writer.show(b, _subframe_delta(rig, b, frame, sub))
+            continue
         decision = _decide(scene, s, rig, frame, playing)
         rig.pending = decision
-        rig.pre_applied.clear()
         rig.fast = fast_allowed and rig.fast_ok and decision[0] == SIM
         snaps = rig.cache[frame][1] if decision[0] == CACHE else None
         for b in rig.bones:
             if snaps is not None:
                 snap = snaps.get(b.name)
-                writer.show(b, snap[13] if snap is not None else IDENTITY)
+                writer.show(b, snap[DELTA] if snap is not None else IDENTITY)
             elif rig.fast and b.ready and b.helper is not None:
                 # show the previous frame's wiggle now, so there's no second evaluation
                 writer.show(b, b.delta)
@@ -723,13 +825,13 @@ def _read_inputs(rig, ob_eval, shift, fast):
         else:
             b.pw_prev = b.qw_prev = None
         b.pw = clean[b.name][0] if clean is not None else mw @ pbe.matrix
-        if b.has_head and b.q_name is not None:
-            if clean is not None and b.q_name in clean:
-                b.qw = clean[b.q_name][0]
-            else:
-                b.qw = mw @ bones[b.q_name].matrix
-        else:
+        q = bones.get(b.q_name) if (b.has_head and b.q_name is not None) else None
+        if q is None:
             b.qw = None
+        elif clean is not None and b.q_name in clean:
+            b.qw = clean[b.q_name][0]
+        else:
+            b.qw = mw @ q.matrix
         b.pin = _read_pin(pbe) if b.has_pin_constraint else None
 
 
@@ -761,15 +863,17 @@ def frame_post(scene, depsgraph):
         rig.pending = None
         if decision is None or decision[1] != frame:
             continue
+        if decision[0] == SUB:
+            rt.counts[SUB] += 1
+            history.append((frame, rig.name, f"motion blur step +{decision[2]:.2f}"))
+            continue
         ob = scene.objects.get(rig.name)
         if ob is None or ob.as_pointer() != rig.ptr:
             continue
         ob_eval = ob.evaluated_get(depsgraph)
         if ob_eval.as_pointer() == ob.as_pointer():
             continue  # armature isn't part of this depsgraph
-        if rig.settings_dirty or rig.settings_animated:
-            refresh_settings(scene, rig, ob)
-        work.append((rig, ob_eval, decision))
+        work.append((rig, ob, ob_eval, decision))
     if not work:
         return
 
@@ -777,12 +881,15 @@ def frame_post(scene, depsgraph):
     world = None
     writer = HelperWriter()
     try:
-        for rig, ob_eval, decision in work:
+        for rig, ob, ob_eval, decision in work:
             try:
+                if rig.settings_dirty or rig.settings_animated:
+                    refresh_settings(scene, rig, ob, ob_eval)
                 world = _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writer)
             except Exception:
                 # one broken rig shouldn't stop the others, it starts over next frame
                 rig.ready = False
+                rt.structure_dirty = True
                 rt.counts["errors"] += 1
                 last_error = traceback.format_exc()
                 history.append((decision[1], rig.name, "error"))
@@ -849,13 +956,7 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
         what += ", render"
     history.append((frame, rig.name, what))
     rig.last_frame = frame
-
-    if not (s.cache_locked and frame in rig.cache):
-        entry = (rig.key, {b.name: solver.snapshot(b) for b in rig.bones})
-        if s.use_cache:
-            rig.cache[frame] = entry
-        else:
-            rig.cache = {frame: entry}
+    _store(rig, frame, s)
     return world
 
 
@@ -871,29 +972,43 @@ def on_depsgraph_update(scene, depsgraph):
         return
     if rt.rendering:
         rt.rendering = False  # a render ended without telling us, don't stay stuck
-        return
-    if time.monotonic() < rt.ignore_updates_until:
-        return
     view_layer = getattr(bpy.context, "view_layer", None)
     if view_layer is not None and depsgraph.view_layer.name != view_layer.name:
         return
     action_changed = False
+    collections_changed = depsgraph.id_type_updated("COLLECTION")
     touched = set()
+    armatures = set()
     for u in depsgraph.updates:
         idd = u.id
         if isinstance(idd, bpy.types.Action):
             action_changed = True
-        elif isinstance(idd, bpy.types.Object) and (u.is_updated_transform or u.is_updated_geometry):
-            touched.add(idd.original.name)
-    if not action_changed and not touched:
+        elif isinstance(idd, bpy.types.Armature):
+            armatures.add(idd.original.as_pointer())  # bones edited, renamed, reparented...
+        elif isinstance(idd, bpy.types.Object):
+            orig = idd.original
+            if not _is_helper(orig) and (u.is_updated_transform or u.is_updated_geometry):
+                touched.add(orig.name)
+    if armatures:
+        for rig in rt.rigs.values():
+            ob = scene.objects.get(rig.name)
+            if ob is not None and ob.data is not None and ob.data.as_pointer() in armatures:
+                touched.add(rig.name)
+    if rt.own_writes and touched and touched <= rt.own_writes and not (armatures or action_changed
+                                                                         or collections_changed):
+        # just the viewport catching up with empties we moved ourselves
+        rt.own_writes = set()
+        return
+    if not action_changed and not touched and not collections_changed:
         return
     for rig in rt.rigs.values():
+        rig.settings_dirty = True  # renamed or new colliders, winds, constraints...
         if action_changed:
             rig.anim_dirty = True
         if rig.name in touched:
-            rig.settings_dirty = True  # constraints may have changed
-            rt.structure_dirty = True  # and ours might have been deleted
-        if action_changed or rig.name in touched or (rig.colliders & touched) or (rig.winds & touched):
+            rt.structure_dirty = True  # bones or our constraints might have changed
+        if (action_changed or collections_changed or rig.name in touched
+                or (rig.colliders & touched) or (rig.winds & touched)):
             invalidate(rig, scene=scene)
 
 
@@ -923,7 +1038,7 @@ def render_finished(scene):
     rt = peek(scene)
     if rt is not None:
         rt.rendering = False
-        rt.ignore_updates_until = time.monotonic() + 1.0
+        rt.own_writes = set(rt.rigs)
 
 
 def playback_stopped(scene):
@@ -932,6 +1047,7 @@ def playback_stopped(scene):
     if rt is None or not scene.emils_wiggle.enabled:
         return
     writer = HelperWriter()
+    written = set()
     for rig in rt.rigs.values():
         if not rig.fast:
             continue
@@ -939,11 +1055,10 @@ def playback_stopped(scene):
         for b in rig.bones:
             if b.name in rig.pre_applied:
                 writer.show(b, b.delta)
+                written.add(rig.name)
         rig.pre_applied.clear()
-    wrote = bool(writer.jobs)
-    writer.flush()
-    if wrote:
-        rt.ignore_updates_until = time.monotonic() + 0.5
+    if writer.flush():
+        rt.own_writes = written
 
 
 def detect_legacy():

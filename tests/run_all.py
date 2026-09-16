@@ -79,6 +79,7 @@ def run_blender(blender, args, result, timeout, env=None):
     started = time.time()
     proc = subprocess.Popen([blender, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
     seen = set()
+    gone_checks = 0
     while time.time() - started < timeout:
         if os.path.exists(result):
             time.sleep(0.5)  # let Blender finish writing
@@ -87,8 +88,12 @@ def run_blender(blender, args, result, timeout, env=None):
             alive = blender_pids() - before
             if alive:
                 seen |= alive
+                gone_checks = 0
             elif seen:
-                return "Blender closed without writing results (crash?)"
+                # tasklist sometimes comes back empty for a moment, so be sure before calling it
+                gone_checks += 1
+                if gone_checks >= 4 and not os.path.exists(result):
+                    return "Blender closed without writing results (crash?)"
         elif proc.poll() is not None:
             return f"Blender exited with code {proc.returncode} without writing results"
         time.sleep(0.5)

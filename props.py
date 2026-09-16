@@ -246,7 +246,7 @@ class EmilsWiggleSceneSettings(bpy.types.PropertyGroup):
                           update=_upd_scene_cache)
     loop: BoolProperty(name="Loop Physics",
                        description="Keep simulating when the timeline loops instead of restarting",
-                       default=True, override=OVR, update=_upd_scene_cache)
+                       default=False, override=OVR, update=_upd_scene_cache)
     preroll: IntProperty(name="Preroll",
                          description="Frames simulated before the start so things are settled",
                          min=0, default=0, override=OVR, update=_upd_scene_cache)

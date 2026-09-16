@@ -708,6 +708,221 @@ def test_robustness():
     check("and the reopened file simulates fine", runtime.peek(scene) is not None and "Rig" in runtime.peek(scene).rigs)
 
 
+def _helper_ptrs(ob):
+    out = {}
+    for pb in ob.pose.bones:
+        c = runtime.find_constraint(pb)
+        if c is not None and c.target is not None:
+            out[pb.name] = c.target.as_pointer()
+    return out
+
+
+def _edit_bones(ob, fn):
+    bpy.context.view_layer.objects.active = ob
+    bpy.ops.object.mode_set(mode="EDIT")
+    fn(ob.data.edit_bones)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    bpy.context.evaluated_depsgraph_get()  # the UI evaluates right after an edit
+
+
+def test_structure_changes():
+    scene = fresh_scene()
+    check("loop physics is off by default", not bpy.types.Scene.bl_rna.properties["emils_wiggle"]
+          .fixed_type.properties["loop"].default)
+    ob = make_chain("Rig")
+    scene.emils_wiggle.enabled = True
+    enable(ob)
+    play(scene, ob, range(1, 6))
+    before = _helper_ptrs(ob)
+
+    # duplicate a wiggle bone in edit mode: the copy keeps the constraint pointing at w1's empty
+    def dup(ebs):
+        src = ebs["w1"]
+        eb = ebs.new("w1_copy")
+        eb.head, eb.tail, eb.parent = src.head.copy(), src.tail.copy() + Vector((0.5, 0, 0)), src.parent
+    _edit_bones(ob, dup)
+    copy = ob.pose.bones["w1_copy"]
+    c = copy.constraints.new("COPY_TRANSFORMS")
+    c.name = runtime.CONSTRAINT_NAME
+    c.target = runtime.find_constraint(ob.pose.bones["w1"]).target  # what Blender's duplicate does
+    copy.emils_wiggle.use_tail = True
+    play(scene, ob, range(6, 9), bone="w1")
+    ptrs = _helper_ptrs(ob)
+    check("a duplicated bone gets its own empty", ptrs["w1_copy"] != ptrs["w1"] and ptrs["w1"] == before["w1"])
+    copy.emils_wiggle.use_tail = False
+    play(scene, ob, range(9, 11), bone="w1")
+    c1 = runtime.find_constraint(ob.pose.bones["w1"])
+    check("unticking the copy leaves the original's empty alone",
+          c1 is not None and c1.target is not None and c1.target.as_pointer() == before["w1"])
+
+    # rename, reparent and delete bones
+    ob.pose.bones["w2"].name = "w2_renamed"
+    errors = runtime.get(scene).counts.get("errors", 0)
+    play(scene, ob, range(11, 14), bone="w1")
+    check("a renamed bone keeps wiggling, without errors",
+          runtime.find_constraint(ob.pose.bones["w2_renamed"]) is not None
+          and "w2_renamed" in runtime.get(scene).rigs["Rig"].by_name
+          and runtime.get(scene).counts.get("errors", 0) == errors)
+    helpers = sum(1 for o in bpy.data.objects if runtime.HELPER_TAG in o)
+    check("no leftover empties after renames and unticks", helpers == 3, f"{helpers} empties")
+
+    def reparent(ebs):
+        ebs["w2_renamed"].use_connect = False
+        ebs["w2_renamed"].parent = ebs["root"]
+    _edit_bones(ob, reparent)
+    play(scene, ob, range(14, 17), bone="w1")
+    rig = runtime.get(scene).rigs["Rig"]
+    check("reparenting a bone rebuilds the chain", rig.by_name["w2_renamed"].parent is None)
+
+    ob.pose.bones["w1"].emils_wiggle.use_head = True
+    _edit_bones(ob, lambda ebs: setattr(ebs["w1"], "use_connect", False))
+    play(scene, ob, range(17, 20), bone="w1")
+    _edit_bones(ob, lambda ebs: ebs.remove(ebs["w0"]))
+    errors = runtime.get(scene).counts.get("errors", 0)
+    play(scene, ob, range(20, 30), bone="w1")
+    check("deleting a bone in the middle of a chain doesn't break anything",
+          runtime.get(scene).counts.get("errors", 0) == errors and "w0" not in runtime.get(scene).rigs["Rig"].by_name)
+
+
+def test_scene_copies():
+    scene = fresh_scene()
+    ob = make_chain("Rig")
+    scene.emils_wiggle.enabled = True
+    enable(ob)
+    play(scene, ob, range(1, 6))
+    original = _helper_ptrs(ob)
+    copy = scene.copy()  # like Scene > New > Full Copy for our purposes
+    rig_copy = ob.copy()
+    rig_copy.data = ob.data.copy()
+    for coll in list(copy.collection.objects):
+        copy.collection.objects.unlink(coll)
+    copy.collection.objects.link(rig_copy)
+    for f in range(1, 6):
+        copy.frame_set(f)
+    mine = _helper_ptrs(rig_copy)
+    check("a copied rig gets its own empties", not (set(mine.values()) & set(original.values())), f"{mine}")
+    copy.emils_wiggle.enabled = False
+    check("turning wiggle off in the copy keeps the original's empties",
+          all(runtime.find_constraint(ob.pose.bones[n]).target is not None for n in original))
+    for f in range(6, 12):
+        scene.frame_set(f)
+    check("and the original keeps wiggling", _helper_ptrs(ob) == original
+          and not basis_close_identity(helper_mat(ob, "w2")))
+    bpy.data.scenes.remove(copy)
+
+
+def test_caches_and_updates():
+    scene = fresh_scene()
+    ob = make_chain("Rig")
+    bpy.ops.mesh.primitive_plane_add(size=0.5, location=(9, 9, 9))
+    far = bpy.context.object
+    coll = bpy.data.collections.new("Colliders")
+    scene.collection.children.link(coll)
+    scene.emils_wiggle.enabled = True
+    enable(ob, collider_type="Collection", collider_collection=coll)
+    runtime.assume_playing = True
+    play(scene, ob, range(1, 21))
+    rt = runtime.get(scene)
+    runtime.playback_stopped(scene)
+    bpy.context.evaluated_depsgraph_get()  # the viewport catching up with the empties we moved
+    count, _, _ = runtime.cache_info(scene)
+    check("stopping playback doesn't wipe the cache", count == 20, f"{count}")
+    runtime.assume_playing = None
+    coll.objects.link(far)
+    bpy.context.evaluated_depsgraph_get()
+    scene.frame_set(21)
+    check("adding a mesh to the collider collection clears the cache and is picked up",
+          "Plane" in rt.rigs["Rig"].colliders and runtime.cache_info(scene)[0] <= 2,
+          f"{sorted(rt.rigs['Rig'].colliders)} {runtime.cache_info(scene)}")
+
+    from EmilsWiggle import legacy
+    Scene = bpy.types.Scene
+
+    class WiggleScene(bpy.types.PropertyGroup):
+        lastframe: bpy.props.IntProperty()
+
+    bpy.utils.register_class(WiggleScene)
+    Scene.wiggle = bpy.props.PointerProperty(type=WiggleScene)
+    scene.wiggle.lastframe = 3
+    bpy.utils.unregister_class(WiggleScene)  # what Wiggle 2's unregister does, leaving Scene.wiggle
+    removed = legacy.clean_dangling_wiggle2()
+    check("Wiggle 2's dangling properties get removed", removed == ["Scene.wiggle"]
+          and "wiggle" not in Scene.bl_rna.properties and scene.get("wiggle") is not None, f"{removed}")
+
+
+def test_render_details():
+    scene = fresh_scene()
+    ob = make_chain("Rig")
+    scene.render.engine = "CYCLES"
+    scene.cycles.samples = 1
+    scene.cycles.device = "CPU"
+    scene.render.resolution_x = scene.render.resolution_y = 8
+    scene.render.use_motion_blur = True
+    cam = bpy.data.objects.new("Cam", bpy.data.cameras.new("Cam"))
+    scene.collection.objects.link(cam)
+    scene.camera = cam
+    scene.frame_end = 8
+    scene.emils_wiggle.enabled = True
+    enable(ob)
+    # animated stiffness: renders have to use the animated value, not the viewport's
+    w1 = ob.pose.bones["w1"].emils_wiggle.tail
+    w1.stiff = 50.0
+    ob.keyframe_insert('pose.bones["w1"].emils_wiggle.tail.stiff', frame=1)
+    w1.stiff = 2000.0
+    ob.keyframe_insert('pose.bones["w1"].emils_wiggle.tail.stiff', frame=8)
+    viewport = {}
+    for f in range(1, 9):
+        scene.frame_set(f)
+        viewport[f] = helper_mat(ob, "w2")
+    rt = runtime.get(scene)
+    runtime.reset_scene(scene)
+    scene.frame_set(4)  # the viewport sits somewhere else, with another stiffness
+    runtime.invalidate_scene(scene, force=True)
+    for rig in rt.rigs.values():
+        rig.ready = False
+    seen = {}
+
+    def spy(sc, dg):
+        if dg is not None and dg.mode == "RENDER":
+            seen.setdefault(sc.frame_current_final, helper_mat(ob, "w2"))
+    bpy.app.handlers.frame_change_post.append(spy)
+    rt.counts.clear()
+    try:
+        scene.render.filepath = os.path.join(tempfile.mkdtemp(), "mb_")
+        bpy.ops.render.render(animation=True)
+    finally:
+        bpy.app.handlers.frame_change_post.remove(spy)
+    whole = sorted(f for f in seen if f == int(f))
+    subs = sorted(f for f in seen if f != int(f))
+    check("motion blur steps are handled without resetting the sim",
+          subs and rt.counts.get("SUB", 0) > 0 and rt.counts.get("RESET", 0) == 1,
+          f"subframes {subs[:4]} counts {dict(rt.counts)}")
+    worst = max(_mdiff(seen[f], viewport[int(f)]) for f in whole)
+    check("render with animated settings and motion blur == viewport", worst < 1e-4, f"{worst:.2e}")
+
+    # a render straight after opening a file
+    path = os.path.join(tempfile.mkdtemp(), "reopen.blend")
+    scene.render.use_motion_blur = False
+    bpy.ops.wm.save_as_mainfile(filepath=path, copy=True)
+    bpy.ops.wm.open_mainfile(filepath=path)
+    scene = bpy.context.scene
+    ob = bpy.data.objects["Rig"]
+    seen.clear()
+
+    def spy2(sc, dg):
+        if dg is not None and dg.mode == "RENDER":
+            seen[sc.frame_current] = helper_mat(ob, "w2")
+    bpy.app.handlers.frame_change_post.append(spy2)
+    try:
+        scene.render.filepath = os.path.join(tempfile.mkdtemp(), "re_")
+        bpy.ops.render.render(animation=True)
+    finally:
+        bpy.app.handlers.frame_change_post.remove(spy2)
+    worst = max((_mdiff(seen[f], viewport[f]) for f in range(1, 9) if f in seen), default=1.0)
+    check("rendering right after opening a file simulates", sorted(seen) == list(range(1, 9)) and worst < 1e-4,
+          f"{sorted(seen)} {worst:.2e}")
+
+
 def _mdiff(a, b):
     return max(abs(a[i][j] - b[i][j]) for i in range(4) for j in range(4))
 
@@ -859,6 +1074,10 @@ def main():
     run(test_fast_preview_and_loop)
     run(test_ui_draw)
     run(test_robustness)
+    run(test_structure_changes)
+    run(test_scene_copies)
+    run(test_caches_and_updates)
+    run(test_render_details)
     from EmilsWiggle import handlers
     check("no errors inside the handlers during the whole run (empty-mesh collider included)",
           handlers.error_count == 0, f"{handlers.error_count} errors, see the log")

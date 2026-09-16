@@ -150,7 +150,6 @@ class EMILSWIGGLE_OT_simulate(bpy.types.Operator):
 
         s.cache_locked = self.lock
         scene.frame_set(frame_back)
-        rt.ignore_updates_until = time.monotonic() + 0.5
         self.report({"INFO"}, f"Simulated {len(frames)} frames in {time.perf_counter() - t0:.1f}s")
         return {"FINISHED"}
 

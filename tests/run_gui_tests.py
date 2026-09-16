@@ -98,7 +98,8 @@ check("lock interface got turned on", scene.render.use_lock_interface)
 
 
 def helper_mat(name):
-    return runtime.find_constraint(rig.pose.bones[name]).target.matrix_basis.copy()
+    ob = bpy.data.objects["Rig"]  # looked up every time, the file gets reopened later
+    return runtime.find_constraint(ob.pose.bones[name]).target.matrix_basis.copy()
 
 
 def mdiff(a, b):
@@ -124,7 +125,7 @@ def ctx():
     win = bpy.context.window_manager.windows[0]
     area = next(a for a in win.screen.areas if a.type in {"VIEW_3D", "DOPESHEET_EDITOR", "TIMELINE"})
     region = next(r for r in area.regions if r.type == "WINDOW")
-    return dict(window=win, screen=win.screen, area=area, region=region, scene=scene)
+    return dict(window=win, screen=win.screen, area=area, region=region, scene=win.scene)
 
 
 def pixels(path):
@@ -212,6 +213,32 @@ def steps():
           pixels(os.path.join(OUT, "still_12.png")) == pixels(os.path.join(OUT, "cached_0012.png")))
     check("frame stayed where it was", scene.frame_current == 12)
 
+    # --- Ctrl+F12 straight after opening the file: the rig gets set up on the render thread
+    path = os.path.join(OUT, "reopen.blend")
+    bpy.ops.wm.save_as_mainfile(filepath=path, copy=True)
+    bpy.ops.wm.open_mainfile(filepath=path)
+    yield 1.0
+    reopened = bpy.context.scene
+    check("nothing is set up before the render", not runtime.get(reopened).rigs)
+    spy_log.clear()
+    bpy.app.handlers.frame_change_post.append(spy)
+    reopened.render.filepath = os.path.join(OUT, "reopen_")
+    with bpy.context.temp_override(**ctx()):
+        bpy.ops.render.render("INVOKE_DEFAULT", animation=True)
+    yield 0.5
+    t0 = time.time()
+    while bpy.app.is_job_running("RENDER") and time.time() - t0 < 120:
+        yield 0.25
+    yield 0.5
+    if spy in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(spy)
+    frames = sorted(spy_log)
+    worst = max((mdiff(m, ref[f]) for f in frames for m in spy_log[f]), default=1.0)
+    check("render right after opening the file simulates like the viewport",
+          frames == list(range(1, 25)) and worst < 1e-4, f"{len(frames)} frames, {worst:.2e}")
+    check("and it didn't create anything from the render thread",
+          sum(1 for o in bpy.data.objects if runtime.HELPER_TAG in o) == 3)
+
 
 _gen = steps()
 
@@ -227,7 +254,7 @@ def tick():
     return None
 
 
-bpy.app.timers.register(tick, first_interval=1.0)
+bpy.app.timers.register(tick, first_interval=1.0, persistent=True)
 
 
 def watchdog():
@@ -235,4 +262,4 @@ def watchdog():
     finish()
 
 
-bpy.app.timers.register(watchdog, first_interval=240.0)
+bpy.app.timers.register(watchdog, first_interval=240.0, persistent=True)

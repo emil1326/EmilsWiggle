@@ -4,12 +4,59 @@ Emil's Wiggle - developer stuff, hidden unless "Developer Tools" is on in the ad
 The report is plain text meant to be pasted into a bug report / chat.
 """
 
+import faulthandler
+import os
+import tempfile
+import time
+
 import bpy
 from bpy.props import BoolProperty
 
 from . import handlers, runtime
 
 force_show = False  # tests draw the debug panel without an installed add-on
+
+CRASH_LOG = os.path.join(tempfile.gettempdir(), "emils_wiggle_crash.log")
+_crash_file = None
+
+
+def enable_crash_log():
+    """If Blender dies, write what every Python thread was doing to CRASH_LOG."""
+    global _crash_file
+    if _crash_file is not None or faulthandler.is_enabled():
+        return
+    try:
+        if os.path.exists(CRASH_LOG) and os.path.getsize(CRASH_LOG) > 512_000:
+            with open(CRASH_LOG, "rb") as f:
+                f.seek(-256_000, os.SEEK_END)
+                keep = f.read()
+            with open(CRASH_LOG, "wb") as f:
+                f.write(keep)
+        _crash_file = open(CRASH_LOG, "a", encoding="utf-8", buffering=1)
+        _crash_file.write(f"\n=== Blender {bpy.app.version_string} started {time.ctime()}"
+                          f" (pid {os.getpid()}) ===\n")
+        faulthandler.enable(_crash_file, all_threads=True)
+    except Exception:
+        _crash_file = None
+
+
+def disable_crash_log():
+    global _crash_file
+    if _crash_file is None:
+        return
+    try:
+        faulthandler.disable()
+        _crash_file.close()
+    except Exception:
+        pass
+    _crash_file = None
+
+
+def _update_crash_log(self, context):
+    if self.crash_log:
+        enable_crash_log()
+    else:
+        disable_crash_log()
 
 
 class EmilsWigglePreferences(bpy.types.AddonPreferences):
@@ -19,16 +66,37 @@ class EmilsWigglePreferences(bpy.types.AddonPreferences):
         name="Developer Tools",
         description="Show a Debug panel with counters and a button that copies a debug report",
         default=False)
+    crash_log: BoolProperty(
+        name="Crash Log",
+        description="If Blender crashes, write what Python was doing at that moment to a log file "
+                    "in the temp folder (costs nothing until a crash)",
+        default=True, update=_update_crash_log)
 
     def draw(self, context):
-        self.layout.prop(self, "show_debug")
+        col = self.layout.column()
+        col.prop(self, "show_debug")
+        col.prop(self, "crash_log")
+        if self.crash_log:
+            col.label(text=CRASH_LOG, icon="FILE_TEXT")
+
+
+def _prefs(context):
+    addon = context.preferences.addons.get(__package__)
+    return addon.preferences if addon is not None else None
 
 
 def debug_enabled(context):
     if force_show:
         return True
-    addon = context.preferences.addons.get(__package__)
-    return addon is not None and addon.preferences.show_debug
+    prefs = _prefs(context)
+    return prefs is not None and prefs.show_debug
+
+
+def _apply_crash_log_pref():
+    prefs = _prefs(bpy.context)
+    if prefs is not None and prefs.crash_log:
+        enable_crash_log()
+    return None
 
 
 def _yes(value):
@@ -137,6 +205,8 @@ def build_report(context):
         lines.append(f"  {span:>9} {rig_name}: {what}")
     lines.append("last error:")
     lines.append(runtime.last_error.rstrip() or "  none")
+    size = os.path.getsize(CRASH_LOG) if os.path.exists(CRASH_LOG) else 0
+    lines.append(f"crash log: {CRASH_LOG} ({'on' if _crash_file else 'off'}, {size // 1024} KB)")
     return "\n".join(lines)
 
 
@@ -149,6 +219,20 @@ class EMILSWIGGLE_OT_copy_report(bpy.types.Operator):
         text = build_report(context)
         context.window_manager.clipboard = text
         self.report({"INFO"}, f"Debug report copied ({len(text.splitlines())} lines)")
+        return {"FINISHED"}
+
+
+class EMILSWIGGLE_OT_open_crash_log(bpy.types.Operator):
+    """Open the crash log file"""
+    bl_idname = "emils_wiggle.open_crash_log"
+    bl_label = "Open Crash Log"
+
+    @classmethod
+    def poll(cls, context):
+        return os.path.exists(CRASH_LOG)
+
+    def execute(self, context):
+        bpy.ops.wm.path_open(filepath=CRASH_LOG)
         return {"FINISHED"}
 
 
@@ -170,6 +254,7 @@ class EMILSWIGGLE_OT_reset_counters(bpy.types.Operator):
 classes = (
     EmilsWigglePreferences,
     EMILSWIGGLE_OT_copy_report,
+    EMILSWIGGLE_OT_open_crash_log,
     EMILSWIGGLE_OT_reset_counters,
 )
 
@@ -177,8 +262,11 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    # the preferences of an add-on can't be read yet while it registers
+    bpy.app.timers.register(_apply_crash_log_pref, first_interval=0.2)
 
 
 def unregister():
+    disable_crash_log()
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

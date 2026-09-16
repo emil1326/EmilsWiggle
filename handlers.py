@@ -21,6 +21,7 @@ def _safe(fn, *args):
         fn(*args)
     except Exception:
         error_count += 1
+        runtime.last_error = traceback.format_exc()
         print("Emil's Wiggle: error in handler")
         traceback.print_exc()
 
@@ -39,6 +40,12 @@ def emils_wiggle_frame_post(scene, depsgraph=None):
 def emils_wiggle_depsgraph_post(scene, depsgraph=None):
     if depsgraph is not None:
         _safe(runtime.on_depsgraph_update, scene, depsgraph)
+
+
+@persistent
+def emils_wiggle_load_pre(*_args):
+    # the old file's objects are about to be freed, drop every reference to them now
+    runtime.clear_all()
 
 
 @persistent
@@ -71,6 +78,7 @@ _HANDLERS = (
     ("frame_change_pre", emils_wiggle_frame_pre),
     ("frame_change_post", emils_wiggle_frame_post),
     ("depsgraph_update_post", emils_wiggle_depsgraph_post),
+    ("load_pre", emils_wiggle_load_pre),
     ("load_post", emils_wiggle_load_post),
     ("undo_post", emils_wiggle_undo_post),
     ("redo_post", emils_wiggle_undo_post),

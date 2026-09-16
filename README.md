@@ -4,11 +4,11 @@ My own take on [Wiggle 2](https://github.com/shteeve3d/blender-wiggle-2) by Stev
 
 It started because the ears and tail on Kita'vali kept doing weird stuff. First the timing was off, then renders didn't match the viewport, and then muting every armature still somehow ate a third of my framerate xD So yeah, I took it apart.
 
-Built for **Blender 3.6 LTS**. It's its own add-on and doesn't touch Emil's Mesh Toolkit at all, they just live in the same repo.
+Built for **Blender 3.6 LTS**. 
 
 ## Install
 
-Zip the `EmilsWiggle` folder (leave `tests` out if you want, Blender doesn't care), then Edit > Preferences > Add-ons > Install and turn on **Emil's Wiggle**. You'll find it in the 3D View sidebar, in the **Emil** tab.
+Run `python tools/build_zip.py` (or just zip the `EmilsWiggle` folder, Blender doesn't care about the extra stuff), then Edit > Preferences > Add-ons > Install and turn on **Emil's Wiggle**. You'll find it in the 3D View sidebar, in the **Emil** tab.
 
 If Wiggle 2 is still installed, turn it off. The panel warns you when both are on for the same scene, since two sims fighting over the same bones isn't fun.
 
@@ -103,23 +103,26 @@ The same code runs in the viewport and on the render thread, it only ever uses t
 | `props.py` | Every setting, saved in the .blend and library overridable |
 | `handlers.py` | Blender app handlers |
 | `operators.py` | Buttons: reset, simulate, bake, copy, select, import |
+| `debug.py` | Developer Tools: the add-on preference, the debug report |
 | `ui.py` | The sidebar panels |
+
+## When something acts weird
+
+Turn on **Developer Tools** in Preferences > Add-ons > Emil's Wiggle. A **Debug** panel shows up at the bottom, with counters and a **Copy Debug Report** button. The report has the settings of every wiggle bone, what the last frames did (cache, sim, fast preview, render...) and the last error, so paste that along with what you saw.
 
 ## Tests
 
-There's a headless test suite that builds rigs, plays them, renders with Cycles and Workbench, saves and reloads, bakes and draws every panel:
+Two suites, both run with one command (plain Python, it finds Blender 3.6 by itself):
 
 ```bash
-blender -b --factory-startup --python EmilsWiggle/tests/run_tests.py -- result.txt
+python tests/run_all.py
 ```
 
-It writes the results to `result.txt` (and a log next to it). Last run: 68 passed on Blender 3.6.23.
+The background one builds rigs, plays them, renders with Cycles and Workbench, saves and reloads, bakes and draws every panel (69 passed last run on Blender 3.6.23). Background mode can't do real playback or threaded renders though, so the second one opens its own little Blender window, plays, stops, does a Ctrl+F12 with and without the cache plus an F12, checks everything and closes itself (12 passed). `--headless` or `--gui` runs just one of them, `-v` shows every check.
 
-Background mode can't do real playback or threaded renders, so there's a second one that opens its own Blender window, plays, stops, does a Ctrl+F12 with and without the cache plus an F12, checks everything and quits by itself (12 passed last time):
+Every bug that gets fixed gets its own test in there too, so it can't sneak back in.
 
-```bash
-blender --factory-startup --no-window-focus --python EmilsWiggle/tests/run_gui_tests.py -- gui_result.txt
-```
+`python tools/build_zip.py` makes the installable zip in `../dist`.
 
 ## Known limits
 

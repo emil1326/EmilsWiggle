@@ -621,7 +621,8 @@ class _MockLayout:
 
 def test_ui_draw():
     import types
-    from EmilsWiggle import ui
+    from EmilsWiggle import debug, ui
+    debug.force_show = True
     scene = fresh_scene()
     ob = make_chain("Rig", connect=False)
     plane = bpy.data.objects.new("Col", bpy.data.meshes.new("Col"))
@@ -665,8 +666,46 @@ def test_ui_draw():
     draw_all(types.SimpleNamespace(scene=scene, object=None, active_pose_bone=None, mode="OBJECT",
                                    selected_pose_bones=None))
     check("every panel draws without bad names", not errors, "; ".join(sorted(set(errors)))[:300])
+    report = debug.build_report(bpy.context)
+    print(report)
+    check("debug report lists the rig, its bones and recent frames",
+          "Rig: 1 bone (1 tail, 1 head)" in report and "w1 (wiggle parent -" in report
+          and "tail: mass" in report and "head: mass" in report and "recent frames:" in report)
+    debug.force_show = False
     check("all panels got drawn at least once", drawn == {c.__name__ for c in ui.classes},
           f"missing {sorted({c.__name__ for c in ui.classes} - drawn)}")
+
+
+def test_robustness():
+    scene = fresh_scene()
+    ob = make_chain("Rig")
+    scene.emils_wiggle.enabled = True
+    enable(ob)
+    play(scene, ob, range(1, 6))
+    w1 = ob.pose.bones["w1"]
+    bpy.data.objects.remove(runtime.find_constraint(w1).target)  # someone deletes an empty behind our back
+    play(scene, ob, range(6, 10))
+    c = runtime.find_constraint(w1)
+    check("a deleted empty gets recreated without crashing", c is not None and c.target is not None)
+
+    import EmilsWiggle
+    EmilsWiggle.unregister()  # what Reload Scripts and quitting Blender do
+    helpers = [runtime.find_constraint(ob.pose.bones[f"w{i}"]) for i in range(3)]
+    check("disabling the add-on keeps the setup but takes the wiggle off",
+          all(h is not None and basis_close_identity(h.target.matrix_basis) for h in helpers))
+    EmilsWiggle.register()
+    play(scene, ob, range(1, 9))
+    check("enabling it again picks the setup back up",
+          scene.emils_wiggle.enabled and not basis_close_identity(helper_mat(ob, "w2")))
+
+    path = os.path.join(tempfile.mkdtemp(), "other.blend")
+    bpy.ops.wm.save_as_mainfile(filepath=path, copy=True)
+    bpy.ops.wm.open_mainfile(filepath=path)
+    check("opening a file forgets the old simulation", all(not rt.rigs for rt in runtime._runtimes.values()))
+    scene = bpy.context.scene
+    ob = bpy.data.objects["Rig"]
+    play(scene, ob, range(1, 6))
+    check("and the reopened file simulates fine", runtime.peek(scene) is not None and "Rig" in runtime.peek(scene).rigs)
 
 
 def _mdiff(a, b):
@@ -819,6 +858,7 @@ def main():
     run(test_import_and_copy_and_bake)
     run(test_fast_preview_and_loop)
     run(test_ui_draw)
+    run(test_robustness)
     from EmilsWiggle import handlers
     check("no errors inside the handlers during the whole run (empty-mesh collider included)",
           handlers.error_count == 0, f"{handlers.error_count} errors, see the log")

@@ -4,7 +4,7 @@ Emil's Wiggle - sidebar panels (View3D > Sidebar > Emil).
 
 import bpy
 
-from . import runtime
+from . import debug, handlers, runtime
 
 
 class EmilsWigglePanel:
@@ -201,9 +201,6 @@ class EMILSWIGGLE_PT_simulation(EmilsWigglePanel, bpy.types.Panel):
         here = runtime.frame_is_cached(scene, scene.frame_current)
         col.label(text=f"Frame {scene.frame_current}: " + ("cached" if here else "not cached"),
                   icon="KEYFRAME_HLT" if here else "KEYFRAME")
-        rt = runtime.peek(scene)
-        if rt is not None and rt.stats_sim_ms:
-            col.label(text=f"Last step: {rt.stats_sim_ms:.2f} ms", icon="TIME")
 
         row = box.row(align=True)
         row.prop(s, "cache_locked", icon="LOCKED" if s.cache_locked else "UNLOCKED", toggle=True)
@@ -254,6 +251,38 @@ class EMILSWIGGLE_PT_bake(EmilsWigglePanel, bpy.types.Panel):
         layout.operator("emils_wiggle.bake", icon="KEYTYPE_KEYFRAME_VEC")
 
 
+class EMILSWIGGLE_PT_debug(EmilsWigglePanel, bpy.types.Panel):
+    bl_label = "Debug"
+    bl_parent_id = "EMILSWIGGLE_PT_main"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return debug.debug_enabled(context)
+
+    def draw(self, context):
+        layout = self.layout
+        rt = runtime.peek(context.scene)
+        col = layout.column(align=True)
+        if rt is None:
+            col.label(text="Not running on this scene")
+        else:
+            col.label(text=f"Last step: {rt.stats_sim_ms:.2f} ms", icon="TIME")
+            for key in ("CACHE", "SIM", "RESET", "SAME", "fast", "converged", "errors"):
+                if rt.counts.get(key):
+                    col.label(text=f"{key}: {rt.counts[key]}")
+            for rig in rt.rigs.values():
+                fast = "ok" if rig.fast_ok else "not possible"
+                bones = f"{len(rig.bones)} bone{'' if len(rig.bones) == 1 else 's'}"
+                col.label(text=f"{rig.name}: {bones}, fast preview {fast}",
+                          icon="ARMATURE_DATA")
+        if handlers.error_count:
+            col.label(text=f"{handlers.error_count} errors, see the report", icon="ERROR")
+        row = layout.row(align=True)
+        row.operator("emils_wiggle.copy_report", icon="COPYDOWN")
+        row.operator("emils_wiggle.reset_counters", icon="LOOP_BACK", text="")
+
+
 classes = (
     EMILSWIGGLE_PT_main,
     EMILSWIGGLE_PT_tail,
@@ -261,6 +290,7 @@ classes = (
     EMILSWIGGLE_PT_simulation,
     EMILSWIGGLE_PT_utilities,
     EMILSWIGGLE_PT_bake,
+    EMILSWIGGLE_PT_debug,
 )
 
 

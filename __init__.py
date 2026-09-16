@@ -19,12 +19,12 @@ bl_info = {
 
 if "bpy" in locals():
     import importlib
-    for _mod in (solver, runtime, props, handlers, operators, ui):  # noqa: F821
+    for _mod in (solver, runtime, props, handlers, operators, debug, ui):  # noqa: F821
         importlib.reload(_mod)
 
 import bpy
 
-from . import solver, runtime, props, handlers, operators, ui
+from . import solver, runtime, props, handlers, operators, debug, ui
 
 
 def _detect_later():
@@ -38,6 +38,7 @@ def _detect_later():
 def register():
     props.register()
     operators.register()
+    debug.register()
     ui.register()
     handlers.register()
     bpy.app.timers.register(_detect_later, first_interval=0.5)
@@ -45,12 +46,14 @@ def register():
 
 def unregister():
     handlers.unregister()
+    # This also runs when Blender quits and on Reload Scripts, so don't delete anything here,
+    # just take the wiggle off. Turning a scene off is what removes the constraints and empties.
     try:
-        for scene in bpy.data.scenes:
-            runtime.strip_scene(scene)
+        runtime.neutralize_helpers()
     except Exception:
         pass
     runtime.clear_all()
     ui.unregister()
+    debug.unregister()
     operators.unregister()
     props.unregister()

@@ -26,7 +26,7 @@ same code runs during F12 / Ctrl+F12 renders on the render thread.
 
 import time
 import traceback
-from collections import Counter
+from collections import Counter, deque
 
 import bpy
 from mathutils import Matrix, Vector
@@ -43,6 +43,8 @@ IDENTITY = Matrix.Identity(4)
 CACHE, SIM, RESET, SAME = "CACHE", "SIM", "RESET", "SAME"
 
 _runtimes = {}
+history = deque(maxlen=60)  # (frame, rig, what happened), for the debug report
+last_error = ""
 
 
 class RigRuntime:
@@ -101,6 +103,16 @@ def peek(scene):
 
 def clear_all():
     _runtimes.clear()
+
+
+def _ptr(obj):
+    """Memory address of a Blender object we hold, or None when Blender already removed it."""
+    if obj is None:
+        return None
+    try:
+        return obj.as_pointer()
+    except ReferenceError:
+        return None
 
 
 def _close(a, b, eps=1e-6):
@@ -213,6 +225,20 @@ def strip_scene(scene):
     cleanup_orphan_helpers()
 
 
+def neutralize_helpers():
+    """Put every empty back to identity without deleting anything (safe while Blender quits)."""
+    coll = helper_collection(create=False)
+    if coll is None or not len(coll.objects):
+        return
+    objects = coll.objects
+    n = len(objects)
+    objects.foreach_set("location", [0.0] * (3 * n))
+    objects.foreach_set("rotation_quaternion", [1.0, 0.0, 0.0, 0.0] * n)
+    objects.foreach_set("scale", [1.0] * (3 * n))
+    for ob in objects:
+        ob.update_tag(refresh={"OBJECT"})
+
+
 class HelperWriter:
     """Moves the empties in one go.
 
@@ -243,9 +269,13 @@ class HelperWriter:
             objects.foreach_get("scale", sca)
         batched = []
         for b, m in self.jobs:
-            i = index.get(b.helper.as_pointer())
+            i = index.get(_ptr(b.helper))
             if i is None:
-                b.helper.matrix_basis = m  # not in the collection somehow, do it the slow way
+                # the empty is gone (deleted, undo, new file...), touching it could crash
+                b.helper = None
+                b.shown = None
+                for rt in _runtimes.values():
+                    rt.structure_dirty = True
                 continue
             l, r, sc = m.decompose()
             loc[3 * i:3 * i + 3] = l[:]
@@ -336,7 +366,7 @@ def _attach(ob, rig, taken):
                 remove_helper(pb)
             continue
         helper = ensure_helper(ob, pb, taken)
-        if b.helper is None or b.helper.as_pointer() != helper.as_pointer():
+        if _ptr(b.helper) != helper.as_pointer():
             b.helper = helper
             b.shown = None
 
@@ -717,6 +747,7 @@ def _converged(rig, snaps):
 
 
 def frame_post(scene, depsgraph):
+    global last_error
     s = scene.emils_wiggle
     if not s.enabled or depsgraph is None:
         return
@@ -753,6 +784,8 @@ def frame_post(scene, depsgraph):
                 # one broken rig shouldn't stop the others, it starts over next frame
                 rig.ready = False
                 rt.counts["errors"] += 1
+                last_error = traceback.format_exc()
+                history.append((decision[1], rig.name, "error"))
                 print(f"Emil's Wiggle: simulating {rig.name} failed")
                 traceback.print_exc()
     finally:
@@ -774,6 +807,7 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
         rig.key = key
         rig.last_frame = frame
         rig.ready = all(b.ready for b in rig.bones)
+        history.append((frame, rig.name, "cache"))
         return world
 
     fast = rig.fast and mode == SIM
@@ -802,11 +836,18 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
                 else:
                     rig.key = rt.new_key("loop")
 
+    what = mode.lower()
+    if mode == SIM and decision[3]:
+        what += ", looped" + (" (settled)" if rig.key == rig.converged_key else "")
     if fast and depsgraph.mode != "RENDER":
         rt.counts["fast"] += 1  # the empties keep last frame's wiggle until the next frame
+        what += ", fast preview"
     else:
         for b in rig.bones:
             writer.show(b, b.delta)
+    if depsgraph.mode == "RENDER":
+        what += ", render"
+    history.append((frame, rig.name, what))
     rig.last_frame = frame
 
     if not (s.cache_locked and frame in rig.cache):

@@ -137,7 +137,7 @@ class EmilsWiggleSideSettings(bpy.types.PropertyGroup):
     mass: FloatProperty(name="Mass", description="Mass of this end, heavier ends pull their chain more",
                         min=0.01, default=1.0, override=OVR, update=_upd("mass"))
     stiff: FloatProperty(name="Stiff", description="Spring stiffness, can be large numbers",
-                         min=0.0, default=400.0, override=OVR, update=_upd("stiff"))
+                         min=0.0, default=200.0, override=OVR, update=_upd("stiff"))
     stretch: FloatProperty(name="Stretch", description="Stretchiness, 0 to 1",
                            min=0.0, max=1.0, default=0.0, override=OVR, update=_upd("stretch"))
     damp: FloatProperty(name="Damp", description="Damping, can be greater than 1",
@@ -151,7 +151,7 @@ class EmilsWiggleSideSettings(bpy.types.PropertyGroup):
         default=False, override=OVR, update=_upd_per_axis("per_axis"))
     stiff_axis: FloatVectorProperty(
         name="Stiff", description="Spring stiffness along the bone's local X, Y (along the bone), Z",
-        size=3, min=0.0, default=(400.0, 400.0, 400.0), subtype="XYZ", override=OVR,
+        size=3, min=0.0, default=(200.0, 200.0, 200.0), subtype="XYZ", override=OVR,
         update=_upd("stiff_axis"))
     damp_axis: FloatVectorProperty(
         name="Damp", description="Damping along the bone's local X, Y (along the bone), Z",

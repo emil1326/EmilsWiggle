@@ -218,7 +218,8 @@ def _empty_cache_scene():
     if sc is None or sc.as_pointer() in _shown_scenes():
         return
     for ob in list(sc.collection.objects):
-        sc.collection.objects.unlink(ob)
+        if ob is not None:
+            sc.collection.objects.unlink(ob)
     for coll in list(sc.collection.children):
         sc.collection.children.unlink(coll)
 
@@ -236,6 +237,18 @@ def remove_all():
     for sc in [s for s in bpy.data.scenes if SCENE_TAG in s]:
         if sc.as_pointer() not in shown and len(bpy.data.scenes) > 1:
             bpy.data.scenes.remove(sc)
+
+
+def repair_after_undo():
+    """Undo can leave freed copies listed in the hidden scene (see runtime.has_holes). Its depsgraph
+    would crash copying it, so the scene goes, the next session makes a new one."""
+    sc = cache_scene()
+    if sc is None or _locked():
+        return
+    if runtime.has_holes(sc.collection) or any(c is None for c in sc.collection.children):
+        if sc.as_pointer() not in _shown_scenes() and len(bpy.data.scenes) > 1:
+            bpy.data.scenes.remove(sc)
+            print("Emil's Wiggle: removed the background cache scene, undo left a freed copy in it")
 
 
 def drop():

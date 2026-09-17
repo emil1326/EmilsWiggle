@@ -71,6 +71,7 @@ def emils_wiggle_save_pre(*_args):
 @persistent
 def emils_wiggle_undo_post(*_args):
     background.drop()
+    _safe(background.repair_after_undo)
     background.note_activity(source="undo")
     _safe(runtime.after_undo)
 
@@ -79,6 +80,12 @@ def emils_wiggle_undo_post(*_args):
 def emils_wiggle_render_init(scene, *_args):
     background.note_activity(source="render")
     _safe(runtime.render_started, scene)
+
+
+@persistent
+def emils_wiggle_playback_pre(scene, *_args):
+    background.note_activity(source="playback")
+    _safe(runtime.playback_started, scene)
 
 
 @persistent
@@ -105,6 +112,7 @@ _HANDLERS = (
     ("render_init", emils_wiggle_render_init),
     ("render_complete", emils_wiggle_render_done),
     ("render_cancel", emils_wiggle_render_done),
+    ("animation_playback_pre", emils_wiggle_playback_pre),
     ("animation_playback_post", emils_wiggle_playback_post),
 )
 

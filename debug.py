@@ -210,6 +210,9 @@ def build_report(context):
                     lines.append(f"    {b.name}: missing")
                     continue
                 bone = pb.bone
+                if bone is None:
+                    lines.append(f"    {b.name}: pose not linked to its bones yet")
+                    continue
                 extra = []
                 if b.helper is None:
                     extra.append("NO HELPER")
@@ -240,7 +243,7 @@ def build_report(context):
             runs[-1][1] = frame
         else:
             runs.append([frame, frame, rig_name, what])
-    for first_frame, last_frame, rig_name, what in runs[-20:]:
+    for first_frame, last_frame, rig_name, what in runs[-30:]:
         span = str(first_frame) if first_frame == last_frame else f"{first_frame}-{last_frame}"
         lines.append(f"  {span:>9} {rig_name}: {what}")
     lines.append("last error:")

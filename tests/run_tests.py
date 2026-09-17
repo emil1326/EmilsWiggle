@@ -149,14 +149,14 @@ def basis_is_identity(pb, eps=1e-5):
 def test_basic_and_settle():
     scene = fresh_scene()
     ob = make_chain("Rig")
-    frames = range(1, 121)
+    frames = range(1, 181)
     rest = play(scene, ob, frames)
     scene.emils_wiggle.enabled = True
     enable(ob)
     wig = play(scene, ob, frames)
     check("wiggle moves the chain", max_diff(wig, rest) > 0.05, f"max diff {max_diff(wig, rest):.4f}")
-    settled = (wig[120] - rest[120]).length
-    check("chain settles back to rest", settled < 0.005, f"diff at 120: {settled:.5f}")
+    settled = (wig[180] - rest[180]).length  # the motion stops on frame 16, default stiffness is soft
+    check("chain settles back to rest", settled < 0.005, f"diff at 180: {settled:.5f}")
     check("lock interface turned on", scene.render.use_lock_interface)
     return rest, wig
 
@@ -320,7 +320,7 @@ def test_axis_lock_and_per_axis(rest, wig):
     d = max_diff(same, wig)
     check("per axis with equal values == single values", d < 0.01 * motion, f"{d:.2e}")
     stiff = tuple(ob.pose.bones["w1"].emils_wiggle.tail.stiff_axis)
-    check("per axis gets seeded from the single value", stiff == (400.0, 400.0, 400.0), f"{stiff}")
+    check("per axis gets seeded from the single value", stiff == (200.0, 200.0, 200.0), f"{stiff}")
 
     scene = fresh_scene()
     ob = make_chain("Rig")
@@ -330,7 +330,7 @@ def test_axis_lock_and_per_axis(rest, wig):
         if pb.name.startswith("w"):
             t = pb.emils_wiggle.tail
             t.per_axis = True
-            t.stiff_axis = (4000.0, 400.0, 400.0)
+            t.stiff_axis = (4000.0, 200.0, 200.0)
     stiffer = play(scene, ob, range(1, 61))
     d_soft = max_diff(wig, rest)
     d_stiff = max_diff(stiffer, rest)
@@ -543,6 +543,9 @@ def test_import_and_copy_and_bake():
     check("import: tail on", s.use_tail)
     check("import: stiffness", abs(s.tail.stiff - 123.0) < 1e-6, f"{s.tail.stiff}")
     check("import: head damp", abs(s.head.damp - 7.0) < 1e-6)
+    check("import: a stiffness Wiggle 2 left at its default stays 400 (ours is 200)",
+          abs(s.head.stiff - 400.0) < 1e-6 and ob.pose.bones["root"].emils_wiggle.tail.stiff == 200.0,
+          f"{s.head.stiff}")
     check("import: collider type", s.tail.collider_type == "Collection")
     check("import: scene enabled, Wiggle 2 switched off",
           scene.emils_wiggle.enabled and not scene["wiggle_enable"])
@@ -1100,6 +1103,32 @@ def test_fast_preview_and_loop():
     check("jumping to the start outside playback reuses the cache", rt.counts.get("CACHE", 0) == 1,
           f"{dict(rt.counts)}")
 
+    # Fast Preview shows every frame one late, cached ones too. Cached frames used to show on time,
+    # so playing through a gap in the cache skipped a frame of wiggle and then repeated one.
+    scene = fresh_scene()
+    scene.emils_wiggle.loop = False
+    ob = make_chain("Rig")
+    scene.emils_wiggle.enabled = True
+    enable(ob)
+    play(scene, ob, range(1, 13))
+    rig = runtime.get(scene).rigs["Rig"]
+    ref = {f: rig.cache[f][1]["w2"][runtime.DELTA].copy() for f in range(1, 13)}
+    del rig.cache[6], rig.cache[7]
+    runtime.assume_playing = True
+    shown = {}
+    try:
+        for f in range(1, 13):
+            scene.frame_set(f)
+            shown[f] = helper_mat(ob, "w2")
+    finally:
+        runtime.assume_playing = None
+    runtime.playback_stopped(scene)
+    lag = max(_mdiff(shown[f], ref[f - 1]) for f in range(2, 13))
+    stopped = _mdiff(helper_mat(ob, "w2"), ref[12])
+    check("fast preview is one frame late the whole way, through a gap in the cache",
+          lag < 1e-5 and rig.cache[6][0] == rig.cache[8][0], f"{lag:.2e} {list(runtime.history)[-12:]}")
+    check("and stopping on a cached frame shows it exactly", stopped < 1e-6, f"{stopped:.2e}")
+
     # renders stay exact even with fast preview on
     scene = fresh_scene()
     ob = make_chain("Rig")
@@ -1287,7 +1316,7 @@ def test_wiggle_groups():
 
     bones["w1"].emils_wiggle.tail.stiff = 77.0
     stiff = [round(bones[f"w{i}"].emils_wiggle.tail.stiff) for i in range(4)]
-    check("editing the active bone then edits the whole group, nothing else", stiff == [77, 77, 400, 400],
+    check("editing the active bone then edits the whole group, nothing else", stiff == [77, 77, 200, 200],
           f"{stiff}")
 
     quietly_activate(1)
@@ -1498,6 +1527,23 @@ def test_background_cache():
     check("it carries on from the last cached frame", done == 20 and worst < 1e-4, f"{done} frames, {worst:.2e}")
     check("the viewport still shows the same wiggle", max_diff(play(scene, ob, range(1, 41)), again) < 1e-6)
 
+    # Gravity turned off after the hidden scene was made: it used to keep simulating with gravity,
+    # and a background frame between two played ones made the bones dip for a frame.
+    scene.use_gravity = False
+    scene.render.fps = 24
+    play(scene, ob, range(1, 41))
+    ref_off = dict(rig.cache)
+    for f in range(21, 41):
+        del rig.cache[f]
+    rig.bg_done = None
+    done = background.run_blocking(scene)
+    worst = max(_entry_diff(rig.cache[f], ref_off[f]) for f in range(21, 41))
+    check("the background cache follows gravity and fps changes", done == 20 and worst < 1e-4,
+          f"{done} frames, {worst:.2e}")
+    scene.use_gravity = True
+    scene.render.fps = 30
+    play(scene, ob, range(1, 41))
+
     # a collider that rides a wiggle bone would differ in the hidden scene, so it's skipped
     floor.parent = ob
     floor.parent_type = "BONE"
@@ -1572,7 +1618,7 @@ def test_dropped_frames():
     try:
         scene.frame_set(1)
         scene.frame_set(9)
-        shown = _mdiff(helper_mat(ob, "w2"), rig.cache[9][1]["w2"][runtime.DELTA])
+        shown = _mdiff(rig.by_name["w2"].delta, rig.cache[9][1]["w2"][runtime.DELTA])
         check("a skip lands on the exact cached frame instead", not rig.cache[9][2] and shown < 1e-5,
               f"approx {rig.cache[9][2]}, shown {shown:.2e}, {runtime.history[-1]}")
         for f in range(5, 9):
@@ -1581,7 +1627,7 @@ def test_dropped_frames():
         scene.frame_set(6)
         scene.frame_set(9)
         check("guesses go back onto the exact run they came from",
-              runtime.history[-1][2] == "cache, back on the exact run", f"{runtime.history[-1]}")
+              runtime.history[-1][2].startswith("cache, back on the exact run"), f"{runtime.history[-1]}")
     finally:
         runtime.assume_playing = None
 
@@ -1639,6 +1685,57 @@ def test_dropped_frames():
         scene.frame_step = 1
     check("a render with Frame Step 6 keeps simulating between frames",
           not rt.counts.get("RESET") and rt.counts.get("SIM", 0) == 4, f"{dict(rt.counts)}")
+
+
+def test_pose_not_linked_yet():
+    """Right after an undo a pose bone can have no bone until Blender rebuilds the pose."""
+    import types
+    scene = fresh_scene()
+    ob = make_chain("Rig")
+    scene.emils_wiggle.enabled = True
+    enable(ob)
+    play(scene, ob, range(1, 4))
+    rt = runtime.get(scene)
+    rig = rt.rigs["Rig"]
+    fake = types.SimpleNamespace(pose=types.SimpleNamespace(bones=[types.SimpleNamespace(bone=None)]))
+    check("a pose that isn't linked yet has no signature", runtime._rig_signature(fake) is None)
+    real = runtime._rig_signature
+    runtime._rig_signature = lambda o: None
+    try:
+        errors = rt.counts.get("errors", 0)
+        runtime.rebuild(scene, rt, edit=True)
+        kept = rt.rigs.get("Rig") is rig and rt.structure_dirty and rt.needs_edit
+        check("the rig is kept and looked at again later, no error", kept and rt.counts.get("errors", 0) == errors
+              and runtime.find_constraint(ob.pose.bones["w1"]) is not None,
+              f"kept {kept}, errors {rt.counts.get('errors', 0) - errors}")
+    finally:
+        runtime._rig_signature = real
+    runtime._edit_now(scene, rt)
+    check("and once it is, everything's back to normal", not rt.structure_dirty and not rt.needs_edit
+          and rt.rigs.get("Rig") is rig)
+
+
+def test_change_mid_run():
+    """Gravity turned off while the chain hangs bent: the frames after that spring back, and a later
+    loop from the first frame used to replay them in the middle of its own run (a twitch)."""
+    scene = fresh_scene()
+    scene.use_gravity = True
+    scene.gravity = (6.0, 0.0, -9.81)  # sideways, so it bends the upright chain
+    scene.emils_wiggle.loop = False
+    try:
+        ob = make_chain("Rig", root_motion=((1, 0.0),))
+        scene.emils_wiggle.enabled = True
+        enable(ob)
+        bent = play(scene, ob, range(1, 21))
+        scene.use_gravity = False
+        play(scene, ob, range(21, 31))
+        straight = play(scene, ob, range(1, 31))
+        worst = max((straight[f] - straight[1]).length for f in range(1, 31))
+        check("frames simulated right after a change aren't replayed as the run from the start",
+              (bent[20] - bent[1]).length > 0.05 and worst < 1e-5, f"bent {(bent[20] - bent[1]).length:.3f}, "
+              f"twitch {worst:.2e}, {list(runtime.history)[-12:]}")
+    finally:
+        scene.gravity = (0.0, 0.0, -9.81)
 
 
 def test_settings_warnings():
@@ -1854,6 +1951,8 @@ def main():
     run(test_dropped_frames)
     run(test_huge_values)
     run(test_settings_warnings)
+    run(test_change_mid_run)
+    run(test_pose_not_linked_yet)
     run(test_wiggle_groups)
     from EmilsWiggle import handlers
     check("no errors inside the handlers during the whole run (empty-mesh collider included)",

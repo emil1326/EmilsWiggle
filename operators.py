@@ -311,6 +311,8 @@ class EMILSWIGGLE_OT_bake(bpy.types.Operator):
 _LEGACY_SIDE = ("mass", "stiff", "stretch", "damp", "gravity", "wind_ob", "wind",
                 "collider_type", "collider", "collider_collection",
                 "radius", "friction", "bounce", "sticky", "chain")
+# Wiggle 2 doesn't save values left at its defaults, and these ones differ from ours
+_LEGACY_DEFAULTS = {"stiff": 400.0}
 
 
 def _legacy_get(owner, key):
@@ -401,6 +403,8 @@ class EMILSWIGGLE_OT_import_wiggle2(bpy.types.Operator):
         for side, suffix in ((s.tail, ""), (s.head, "_head")):
             for name in _LEGACY_SIDE:
                 v = _legacy_get(pb, "wiggle_" + name + suffix)
+                if v is None:
+                    v = _LEGACY_DEFAULTS.get(name)
                 if v is None:
                     continue
                 if name == "collider_type":

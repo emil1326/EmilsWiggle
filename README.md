@@ -160,7 +160,7 @@ Two suites, both run with one command (plain Python, it finds Blender 3.6 by its
 python tests/run_all.py
 ```
 
-The background one builds rigs, plays them, renders with Cycles and Workbench, saves and reloads, bakes, plays with Wiggle Groups and draws every panel (182 passed last run on Blender 3.6.23). Background mode can't do real playback or threaded renders though, so the second one opens its own little Blender window, plays, stops, does a Ctrl+F12 with and without the cache plus an F12, copies and switches scenes, exports an Alembic in the background, sits still to let the Background Cache work, plays with frames dropping, clicks Wiggle Groups, checks everything and closes itself (36 passed). `--headless` or `--gui` runs just one of them, `-v` shows every check.
+The background one builds rigs, plays them, renders with Cycles and Workbench, saves and reloads, bakes, plays with Wiggle Groups and draws every panel (190 passed last run on Blender 3.6.23). Background mode can't do real playback or threaded renders though, so the second one opens its own little Blender window, plays, stops, does a Ctrl+F12 with and without the cache plus an F12, copies and switches scenes, exports an Alembic in the background, sits still to let the Background Cache work, plays with frames dropping, uses the arrow keys, inserts a keyframe, clicks Wiggle Groups, checks everything and closes itself (39 passed). `--headless` or `--gui` runs just one of them, `-v` shows every check.
 
 Every bug that gets fixed gets its own test in there too, so it can't sneak back in.
 

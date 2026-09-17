@@ -339,6 +339,41 @@ def steps():
     here.frame_end = 24
     here.sync_mode = sync
 
+    # --- arrow keys, jumps and pressing play send an update listing everything animated as changed,
+    # which used to throw the whole cache away every time
+    rig_ob = bpy.data.objects["Rig"]
+    runtime.invalidate_scene(here, force=True)
+    for f in range(1, 25):
+        here.frame_set(f)
+    here.frame_set(12)
+    yield 0.5
+    rt2.counts.clear()
+    with bpy.context.temp_override(**ctx()):
+        bpy.ops.screen.frame_offset(delta=1)
+    yield 0.3
+    with bpy.context.temp_override(**ctx()):
+        bpy.ops.screen.frame_jump(end=False)
+    yield 0.3
+    with bpy.context.temp_override(**ctx()):
+        bpy.ops.screen.animation_play()
+    yield 0.6
+    with bpy.context.temp_override(**ctx()):
+        bpy.ops.screen.animation_cancel(restore_frame=False)
+    yield 0.3
+    count = runtime.cache_info(here)[0]
+    cleared = {k: v for k, v in rt2.counts.items() if "cleared" in k}
+    check("frame changes and pressing play keep the cache", count == 24 and not cleared
+          and rt2.counts.get("frame change echoes", 0) >= 3, f"{count} {dict(rt2.counts)}")
+    bpy.context.view_layer.objects.active = rig_ob
+    rig_ob.select_set(True)
+    with bpy.context.temp_override(**ctx()):
+        bpy.ops.anim.keyframe_insert(type="Location")
+    yield 0.3
+    count = runtime.cache_info(here)[0]
+    check("a real keyframe edit still clears it", count < 24 and rt2.counts.get("cache cleared: an action changed"),
+          f"{count} {dict(rt2.counts)}")
+    here.frame_set(1)
+
     # --- Wiggle Groups in a real window: picking a group or bones leaves the cache alone
     from EmilsWiggle import groups
     rig_ob = bpy.data.objects["Rig"]
@@ -375,6 +410,10 @@ def steps():
     with bpy.context.temp_override(**ctx()):
         bpy.ops.screen.animation_cancel(restore_frame=False)
     yield 0.3
+    entry = rt2.rigs["Rig"].cache.get(here.frame_current)
+    off = mdiff(helper_mat("w2"), entry[1]["w2"][runtime.DELTA]) if entry is not None else 1.0
+    check("cached playback stops on the exact wiggle (Fast Preview shows cached frames late too)",
+          off < 1e-5 and rt2.counts.get("CACHE", 0) > 5, f"{off:.2e} {dict(rt2.counts)}")
     rig_ob.pose.bones["w1"].rotation_quaternion = (1.0, 0.1, 0.0, 0.0)
     yield 0.5
     count = runtime.cache_info(here)[0]

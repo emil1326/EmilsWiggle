@@ -33,6 +33,7 @@ objects or constraints. Setting up empties/constraints happens in frame_change_p
 (after the evaluation) or in a timer on the main thread instead, see request_edits().
 """
 
+import itertools
 import math
 import threading
 import time
@@ -59,7 +60,8 @@ CACHE, SIM, RESET, SAME, SUB = "CACHE", "SIM", "RESET", "SAME", "SUB"
 
 _runtimes = {}
 _MAIN_THREAD = threading.main_thread()
-history = deque(maxlen=60)  # (frame, rig, what happened), for the debug report
+history = deque(maxlen=150)  # (frame, rig, what happened), for the debug report
+_edit_keys = itertools.count(1)
 last_error = ""
 
 
@@ -120,6 +122,8 @@ class SceneRuntime:
         self.frame_ms = 0.0  # playback: time between frames
         self.last_play_frame = None
         self.last_play_time = 0.0
+        self.hitch = ""  # playback: this frame came late, for the debug report
+        self.frame_moved = False  # a frame change or playback start since the last depsgraph update
         self.counts = Counter()
 
     def new_key(self, tag, base=None):
@@ -211,6 +215,35 @@ def helper_collection(create=True):
         coll = bpy.data.collections.new(HELPER_COLLECTION)
         coll.use_fake_user = True
     return coll
+
+
+def has_holes(coll):
+    """A collection that lists an object Blender already freed. Undo leaves those behind when an
+    object made since the last undo step goes away but the collection is kept as it was in
+    memory (our empties get made by timers and handlers, never by an operator). Blender crashes
+    as soon as anything walks such a collection in C (copying it, foreach_get/set...)."""
+    return any(o is None for o in coll.objects)
+
+
+_needs_repair = False
+
+
+def repair_helper_collection():
+    """Rebuild our collection without the holes. Main thread only, never during a render."""
+    global _needs_repair
+    _needs_repair = False
+    coll = bpy.data.collections.get(HELPER_COLLECTION)
+    if coll is None or coll.library is not None or not has_holes(coll):
+        return False
+    keep = [o for o in coll.objects if o is not None]
+    bpy.data.collections.remove(coll)  # frees the list without looking at what's in it
+    fresh = helper_collection(create=True)
+    for o in keep:
+        fresh.objects.link(o)
+    print(f"Emil's Wiggle: rebuilt the {HELPER_COLLECTION} collection, undo left a freed empty in it")
+    for rt in _runtimes.values():
+        rt.structure_dirty = True
+    return True
 
 
 def ensure_helper(ob, pb, taken):
@@ -314,7 +347,7 @@ def strip_scene(scene):
 def neutralize_helpers():
     """Put every empty back to identity without deleting anything (safe while Blender quits)."""
     coll = helper_collection(create=False)
-    if coll is None or not len(coll.objects):
+    if coll is None or not len(coll.objects) or has_holes(coll):
         return
     objects = coll.objects
     n = len(objects)
@@ -346,13 +379,20 @@ class HelperWriter:
         b.shown = m.copy()
 
     def flush(self):
-        global bad_writes
+        global bad_writes, _needs_repair
         if not self.jobs:
             return 0
         coll = helper_collection(create=False)
+        members = list(coll.objects) if coll is not None else []
+        if any(o is None for o in members):
+            # foreach_get/set would crash, and this can run anywhere (render thread, frame_change_pre)
+            self.jobs.clear()
+            _needs_repair = True
+            request_edits()
+            return 0
         objects = coll.objects if coll is not None else ()
-        n = len(objects)
-        index = {o.as_pointer(): i for i, o in enumerate(objects)}
+        n = len(members)
+        index = {o.as_pointer(): i for i, o in enumerate(members)}
         loc, rot, sca = [0.0] * (3 * n), [0.0] * (4 * n), [0.0] * (3 * n)
         if n:
             objects.foreach_get("location", loc)
@@ -390,7 +430,12 @@ class HelperWriter:
 # ---------------------------------------------------------------- structure
 
 def _rig_signature(ob):
-    """Everything a rig's structure depends on. A change means the rig gets rebuilt."""
+    """Everything a rig's structure depends on. A change means the rig gets rebuilt.
+
+    None while the pose isn't linked to its bones (right after an undo, until Blender rebuilds it).
+    """
+    if any(pb.bone is None for pb in ob.pose.bones):
+        return None
     entries = []
     for pb in ob.pose.bones:
         s = pb.emils_wiggle
@@ -491,6 +536,7 @@ def rebuild(scene, rt, edit=True):
     new_rigs = {}
     taken = set()
     removed_something = False
+    waiting = False
     enabled = scene.emils_wiggle.enabled
     for ob in scene.objects:
         if ob.type != "ARMATURE" or ob.pose is None:
@@ -498,6 +544,12 @@ def rebuild(scene, rt, edit=True):
         try:
             os_ = ob.emils_wiggle
             signature = _rig_signature(ob) if enabled and not (os_.mute or os_.freeze) else ()
+            if signature is None:
+                # keep what we had and look again after Blender's next update
+                waiting = True
+                if ob.name in old_rigs:
+                    new_rigs[ob.name] = old_rigs[ob.name]
+                continue
             if not signature or not _editable(ob):
                 if edit and signature == ():
                     removed_something |= strip_object(ob)
@@ -520,10 +572,10 @@ def rebuild(scene, rt, edit=True):
     if edit and (removed_something or any(name not in new_rigs for name in old_rigs)):
         cleanup_orphan_helpers()
     rt.rigs = new_rigs
-    rt.structure_dirty = False
+    rt.structure_dirty = waiting
     rt.object_count = len(scene.objects)
-    rt.needs_edit = not edit
-    if not edit:
+    rt.needs_edit = not edit or waiting
+    if rt.needs_edit:
         request_edits()
 
 
@@ -545,6 +597,11 @@ def _apply_edits():
         wm = getattr(bpy.context, "window_manager", None)
         busy = bpy.app.is_job_running("RENDER") or (wm is not None and wm.is_interface_locked)
         again = False
+        if _needs_repair:
+            if busy:
+                again = True
+            else:
+                repair_helper_collection()
         for scene in bpy.data.scenes:
             rt = peek(scene)
             if rt is None or not rt.needs_edit:
@@ -700,6 +757,11 @@ def invalidate(rig, force=False, scene=None):
     rig.cache.clear()
     rig.cache_gen += 1
     rig.converged_key = None
+    # The sim goes on from where the bones are, which isn't where the new settings would have
+    # put them (they still sag from the gravity that just got turned off, say). Those frames
+    # mustn't pass for the run from the first frame, or a later loop replays them in the middle
+    # of the real run and the bones twitch.
+    rig.key = ("edited", next(_edit_keys))
 
 
 def invalidate_scene(scene, force=False):
@@ -1006,14 +1068,17 @@ def _validate(scene, rt, edit):
         rebuild(scene, rt, edit)
 
 
-def _time_playback(rt, frame):
+def _time_playback(rt, frame, scene):
     now = time.perf_counter()
+    rt.hitch = ""
     if rt.last_play_frame is not None and now - rt.last_play_time < 2.0:
         ms = (now - rt.last_play_time) * 1000.0
         rt.frame_ms = ms if rt.frame_ms <= 0.0 else rt.frame_ms * 0.8 + ms * 0.2
         jump = frame - rt.last_play_frame
         if jump > 1:
             rt.counts["dropped frames"] += jump - 1
+        if ms > 1500.0 * scene.render.fps_base / scene.render.fps:
+            rt.hitch = f", came {ms:.0f} ms after frame {rt.last_play_frame}"
     rt.last_play_frame = frame
     rt.last_play_time = now
 
@@ -1033,9 +1098,13 @@ def frame_pre(scene):
     rendering = rt.rendering or not _on_main_thread()
     playing = rt.force_fast or (not rendering and _is_playing())
     live_play = playing and not rendering and not rt.force_fast
+    if not rendering:
+        rt.frame_moved = True
     prev_play = rt.last_play_frame
-    if live_play and frame != rt.last_play_frame:
-        _time_playback(rt, frame)
+    if not live_play:
+        rt.hitch = ""
+    elif frame != rt.last_play_frame:
+        _time_playback(rt, frame, scene)
     # Fast Preview only while the viewport plays, never for renders
     fast_allowed = s.fast_preview and playing and not rendering
     writer = HelperWriter()
@@ -1055,17 +1124,21 @@ def frame_pre(scene):
         continuing = live_play and prev_play is not None and rig.last_frame == prev_play
         decision = _decide(scene, s, rig, frame, playing, rendering, continuing)
         rig.pending = decision
-        rig.fast = fast_allowed and rig.fast_ok and decision[0] == SIM
-        snaps = rig.cache[frame][1] if decision[0] == CACHE else None
+        cached = decision[0] == CACHE
+        # Fast Preview shows the wiggle one frame late, cached frames too: showing those on time
+        # skipped a frame of wiggle when playback reached cached frames and repeated one when
+        # it left them, a little stutter wherever the cache had a gap.
+        rig.fast = fast_allowed and rig.fast_ok and (decision[0] == SIM or (cached and rig.ready))
+        snaps = rig.cache[frame][1] if cached else None
         for b in rig.bones:
-            if snaps is not None:
-                snap = snaps.get(b.name)
-                writer.show(b, snap[DELTA] if snap is not None else IDENTITY)
-            elif rig.fast and b.ready and b.helper is not None:
+            if rig.fast and b.ready and b.helper is not None:
                 # show the previous frame's wiggle now, so there's no second evaluation
                 writer.show(b, b.delta)
                 b.pre_delta_inv = b.shown.inverted_safe()
                 rig.pre_applied.add(b.name)
+            elif snaps is not None:
+                snap = snaps.get(b.name)
+                writer.show(b, snap[DELTA] if snap is not None else IDENTITY)
             else:
                 writer.show(b, IDENTITY)
     writer.flush()
@@ -1300,7 +1373,10 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
         _restore_frame(rig, frame)
         rig.last_frame = frame
         rig.ready = all(b.ready for b in rig.bones)
-        history.append((frame, rig.name, "cache" + (f", {rig.why}" if rig.why else "")))
+        what = "cache" + (f", {rig.why}" if rig.why else "")
+        if rig.fast and depsgraph.mode != "RENDER":
+            what += ", fast preview"
+        history.append((frame, rig.name, what + rt.hitch))
         return world
 
     what = mode.lower()
@@ -1376,7 +1452,7 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
             writer.show(b, b.delta)
     if depsgraph.mode == "RENDER":
         what += ", render"
-    history.append((frame, rig.name, what))
+    history.append((frame, rig.name, what + rt.hitch))
     rig.last_frame = frame
     _store(rig, frame, s, rt)
     return world
@@ -1483,6 +1559,7 @@ def on_depsgraph_update(scene, depsgraph):
     rt = peek(scene)
     if rt is None:
         return
+    frame_moved, rt.frame_moved = rt.frame_moved, False
     if bpy.app.is_job_running("RENDER"):
         for rig in rt.rigs.values():
             forget_selection(rig)  # whatever gets clicked meanwhile isn't compared
@@ -1511,8 +1588,26 @@ def on_depsgraph_update(scene, depsgraph):
     collections_changed = maybe and _colliders_changed(scene, rt, depsgraph)
     touched = set()
     armatures = set()
+    # Changing frames from the UI (arrow keys, the timeline, pressing play) sends one more update
+    # that lists the scene and everything animated as changed, although nothing was edited. That
+    # used to throw the whole cache away every time. It comes right after a frame change, with the
+    # scene in it, and never with a rig's armature (a keyframe inserted in object mode has that).
+    rig_data = {}
+    for rig in rt.rigs.values():
+        ob = scene.objects.get(rig.name)
+        if ob is not None and ob.data is not None:
+            rig_data[rig.name] = ob.data.as_pointer()
+    echo = (frame_moved
+            and any(isinstance(u.id, bpy.types.Scene) and not u.is_updated_transform
+                    and not u.is_updated_geometry for u in depsgraph.updates)
+            and not any(isinstance(u.id, bpy.types.Armature) and u.id.original.as_pointer() in rig_data.values()
+                        for u in depsgraph.updates))
+    if echo:
+        rt.counts["frame change echoes"] += 1
     for u in depsgraph.updates:
         idd = u.id
+        if echo and isinstance(idd, (bpy.types.Action, bpy.types.Object)):
+            continue  # animation moving things, the frame handlers already took care of that
         if isinstance(idd, bpy.types.Action):
             action_changed = True
         elif isinstance(idd, bpy.types.Armature):
@@ -1521,21 +1616,16 @@ def on_depsgraph_update(scene, depsgraph):
             orig = idd.original
             if not _is_helper(orig) and (u.is_updated_transform or u.is_updated_geometry):
                 touched.add(orig.name)
-    rig_data = {}
-    for rig in rt.rigs.values():
-        ob = scene.objects.get(rig.name)
-        if ob is not None and ob.data is not None:
-            rig_data[rig.name] = ob.data.as_pointer()
-            if rig_data[rig.name] in armatures:
-                touched.add(rig.name)
+    for name, data in rig_data.items():
+        if data in armatures:
+            touched.add(name)
     for rig in rt.rigs.values():
         if rig.name in touched and _only_clicked(scene, rig, rig.ptr in clicked):
             touched.discard(rig.name)
             armatures.discard(rig_data.get(rig.name))
             rt.counts["clicks ignored"] += 1
-    if rt.own_writes and touched and touched <= rt.own_writes and not (armatures or action_changed
-                                                                         or collections_changed):
-        # just the viewport catching up with empties we moved ourselves
+    if rt.own_writes and touched & rt.own_writes and not (armatures or action_changed or collections_changed):
+        # just the viewport catching up with empties we moved ourselves (and whatever hangs off those bones)
         rt.own_writes = set()
         return
     if not action_changed and not touched and not collections_changed:
@@ -1562,6 +1652,7 @@ def on_depsgraph_update(scene, depsgraph):
 
 
 def after_undo():
+    repair_helper_collection()
     for scene in bpy.data.scenes:
         rt = peek(scene)
         if rt is None:
@@ -1589,6 +1680,12 @@ def render_finished(scene):
     if rt is not None:
         rt.rendering = False
         rt.own_writes = set(rt.rigs)
+
+
+def playback_started(scene):
+    rt = peek(scene)
+    if rt is not None:
+        rt.frame_moved = True  # pressing play sends the same update a frame change does
 
 
 def playback_stopped(scene):

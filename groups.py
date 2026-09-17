@@ -104,6 +104,8 @@ def _depth(pb):
 
 def visible(pb):
     bone = pb.bone
+    if bone is None:
+        return False  # the pose isn't linked to its bones yet (right after an undo)
     return not bone.hide and any(a and b for a, b in zip(bone.layers, pb.id_data.data.layers))
 
 

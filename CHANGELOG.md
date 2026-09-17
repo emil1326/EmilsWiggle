@@ -2,13 +2,21 @@
 
 ## 1.3.0 (2026-09-16)
 
-Wiggle Groups, clicking bones doesn't nuke the cache anymore, and no more random resets during slow playback.
+Wiggle Groups, and a bunch of cache bugs that made the wiggle twitch or stutter.
+
+- The cache got thrown away every time you pressed play, hit an arrow key or jumped frames. Blender sends one more update after a UI frame change that says everything animated changed, and the add-on believed it. So the cache (Background Cache included) almost never survived real use. Those updates get recognized now.
+- Bones could twitch for a frame and then wobble, in the same spot every loop, with no gravity and a parent that doesn't move. Changing a setting (like turning gravity off) clears the cache, but the sim goes on from where the bones are (still bent by the old gravity), and those frames got saved as if they belonged to the run from the first frame. The next loop replayed them in the middle of its own run. They're kept apart now, and the next loop or the Background Cache redoes them properly. That's also why changing a setting back and forth seemed to fix it, it just threw those frames away.
+- Fast Preview shows cached frames one frame late too, like the frames it simulates. Before, playback skipped one frame of wiggle when it reached cached frames and repeated one when it left them, a small stutter wherever the cache had a gap.
+- Stopping playback made the cache clear itself when an object hangs off a wiggle bone.
+- A crash after undo: the empties get made by timers, after Blender's own undo step, and undoing right then could leave a freed empty listed in the helper collection (same for the Background Cache's hidden scene). Blender crashes as soon as something reads a collection like that. Both get cleaned up right after every undo now, and nothing writes to a collection in that state.
+- Right after an undo a pose can be missing its bones for a moment, setting the rig up then failed. It waits for Blender now.
+- Default Stiff is 200 now (was 400). Wiggle 2 files still import with Wiggle 2's 400 where it never saved a value.
 
 - Wiggle Groups: a list of named bone selections per armature, in pose mode. Click a group and its bones get selected, then the usual Tail/Head settings edit all of them at once (with Edit All Selected on). A bone is in one group at most. Add, remove, assign, remove from group, select and deselect buttons, and the main panel shows which group the active bone is in.
 - Selecting, deselecting or hiding bones in pose mode, or clicking a group, cleared the whole cache because Blender reports it like an edit of the armature. The add-on now compares the pose, the rest bones, the object matrix and the constraints, and only a real change clears the cache.
 - Slow playback could make the wiggle look like it reset in the middle of the animation, seemingly at random. When frames got skipped, the guessed frames jumped onto any exact frame in the cache, even one from another run (like the one the Background Cache made from the first frame while you were paused somewhere else). They only go back onto the run they were guessed from now, and only right after.
 - A single frame taking more than a second during playback restarted the wiggle from rest. Playback keeps simulating through it now.
-- The debug report says why a frame started over (a jump, playback skipping ahead...).
+- The debug report says why a frame started over (a jump, playback skipping ahead...), which frames came late during playback, and counts the frame change updates it ignored.
 - Copy Settings to Selected doesn't move bones between groups.
 - The debug report lists the groups and which group every wiggle bone is in.
 

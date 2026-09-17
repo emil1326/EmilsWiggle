@@ -819,6 +819,9 @@ def check_invariants(label):
         for ob in scene.objects:
             if runtime.HELPER_TAG in ob:
                 problem(f"{label}: helper {ob.name} ended up in scene {scene.name}")
+    for coll in list(bpy.data.collections) + [sc.collection for sc in scenes()]:
+        if any(o is None for o in coll.objects):
+            problem(f"{label}: collection {coll.name} lists an object that doesn't exist anymore")
     hidden = background.cache_scene()
     if GUI and hidden is not None and any(w.scene == hidden for w in bpy.context.window_manager.windows):
         problem(f"{label}: the background cache's scene is shown in a window")
@@ -850,6 +853,9 @@ def setup():
 
 
 DUMP_AT = int(os.environ.get("EMILS_WIGGLE_STRESS_DUMP", "0"))  # save the file before this action
+# Without undo pushes, undo also frees objects the actions linked into scenes, which leaves holes
+# Blender itself crashes on. Only useful to check our own repair (runtime.has_holes).
+PUSH_UNDO = not os.environ.get("EMILS_WIGGLE_STRESS_NO_PUSH")
 
 
 def run_one(i):
@@ -869,6 +875,11 @@ def run_one(i):
     started = time.perf_counter()
     try:
         result = action()
+        busy = bpy.app.is_job_running("RENDER") or bpy.context.window_manager.is_interface_locked
+        if GUI and PUSH_UNDO and not busy and action not in (act_undo, act_undo_push):
+            # what the UI does after every edit; our own setup still happens later, from timers
+            with bpy.context.temp_override(**ctx()):
+                bpy.ops.ed.undo_push(message=name)
     except Exception as e:
         stats["op_errors"] += 1
         key = f"{name}: {type(e).__name__}: {str(e)[:120]}"

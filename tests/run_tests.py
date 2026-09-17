@@ -1575,8 +1575,51 @@ def test_dropped_frames():
         shown = _mdiff(helper_mat(ob, "w2"), rig.cache[9][1]["w2"][runtime.DELTA])
         check("a skip lands on the exact cached frame instead", not rig.cache[9][2] and shown < 1e-5,
               f"approx {rig.cache[9][2]}, shown {shown:.2e}, {runtime.history[-1]}")
+        for f in range(5, 9):
+            del rig.cache[f]
+        scene.frame_set(1)
+        scene.frame_set(6)
+        scene.frame_set(9)
+        check("guesses go back onto the exact run they came from",
+              runtime.history[-1][2] == "cache, back on the exact run", f"{runtime.history[-1]}")
     finally:
         runtime.assume_playing = None
+
+    # The rig sits on its own run (it started from rest on frame 30) while the background cache fills
+    # the range from the first frame. Slow playback from there used to jump onto those frames, which
+    # looks just like the wiggle resetting in the middle of the animation.
+    from EmilsWiggle import background
+    runtime.playback_stopped(scene)
+    runtime.invalidate_scene(scene, force=True)
+    scene.frame_set(30)
+    background.run_blocking(scene)
+    runtime.assume_playing = True
+    try:
+        rt.counts.clear()
+        scene.frame_set(35)
+        scene.frame_set(40)
+        check("guesses never jump onto another run's frames", not rt.counts.get("CACHE")
+              and rt.counts.get("SIM") == 2 and not rig.cache[40][2], f"{dict(rt.counts)} {runtime.history[-1]}")
+
+        # one frame taking longer than a second skips more frames than the fps, still the same playback
+        runtime.playback_stopped(scene)
+        scene.frame_end = 200
+        runtime.invalidate_scene(scene, force=True)
+        scene.frame_set(1)
+        scene.frame_set(2)
+        rt.counts.clear()
+        scene.frame_set(50)
+        check("a frame that takes over a second doesn't restart the sim",
+              not rt.counts.get("RESET") and rt.counts.get("SIM") == 1, f"{dict(rt.counts)} {runtime.history[-1]}")
+        runtime.playback_stopped(scene)
+        scene.frame_set(120)
+        check("starting playback far from the last frame still starts over, and the report says why",
+              rt.counts.get("RESET") == 1 and runtime.history[-1][2] == "reset (playback went from frame 50 to 120)",
+              f"{dict(rt.counts)} {runtime.history[-1]}")
+    finally:
+        runtime.assume_playing = None
+        runtime.playback_stopped(scene)
+        scene.frame_end = 60
 
     # Frame Step renders
     scene.render.engine = "BLENDER_WORKBENCH"

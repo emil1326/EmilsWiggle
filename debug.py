@@ -193,7 +193,7 @@ def build_report(context):
             heads = sum(b.has_head for b in rig.bones)
             lines.append(
                 f"  {rig.name}: {_n(len(rig.bones), 'bone')} ({tails} tail, {heads} head), ready {_yes(rig.ready)},"
-                f" last frame {rig.last_frame}, cached {len(rig.cache)}, approx {_yes(rig.approx)},"
+                f" last frame {rig.last_frame}, cached {len(rig.cache)}, approx {_yes(rig.approx)} (since {rig.approx_since}),"
                 f" fast preview {'ok' if rig.fast_ok else 'no (' + rig.fast_reason + ')'},"
                 f" settings animated {_yes(rig.settings_animated)},"
                 f" blew up {rig.blowups}x (last frame {rig.blowup_frame}, {rig.blowup_bones[:6]}),"

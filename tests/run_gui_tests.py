@@ -315,15 +315,18 @@ def steps():
     runtime.invalidate_scene(here, force=True)
     here.frame_set(1)
 
+    calls = []
+
     def slow(sc, *_args):
-        time.sleep(0.3)
+        calls.append(sc.frame_current)
+        time.sleep(1.5 if len(calls) == 3 else 0.3)  # one frame slower than a second's worth of frames
     bpy.app.handlers.frame_change_post.append(slow)
     rt2.counts.clear()
     try:
         with bpy.context.temp_override(**ctx()):
             bpy.ops.screen.animation_play()
         t0 = time.time()
-        while time.time() - t0 < 2.5:
+        while time.time() - t0 < 3.5:
             yield 0.1
         with bpy.context.temp_override(**ctx()):
             bpy.ops.screen.animation_cancel(restore_frame=False)

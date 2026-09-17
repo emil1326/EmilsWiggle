@@ -86,6 +86,8 @@ class RigRuntime:
         self.cache = {}  # frame -> (key, {bone: snapshot}, approximate)
         self.cache_gen = 0  # goes up whenever the cache gets cleared
         self.approx = False  # the state came from skipped frames, don't let it replace exact ones
+        self.approx_since = None  # frame where the guessing started, None when unknown
+        self.why = ""  # why _decide picked what it picked, for the debug report
         self.bg_done = None  # cache_gen the background cache finished (or gave up) on
         self.bg_reason = ""
         self.fast_reason = ""
@@ -120,9 +122,17 @@ class SceneRuntime:
         self.last_play_time = 0.0
         self.counts = Counter()
 
-    def new_key(self, tag):
+    def new_key(self, tag, base=None):
+        """A key for a new run. Guessed runs ("skip") carry the exact run they were guessed from."""
         self.key_counter += 1
-        return (tag, self.key_counter)
+        return (tag, self.key_counter, base) if tag == "skip" else (tag, self.key_counter)
+
+
+def exact_run(key):
+    """The exact run a key's frames follow: the key itself, or for guessed frames the run they came from."""
+    if key is not None and key[0] == "skip":
+        return key[2]
+    return key
 
 
 def get(scene):
@@ -760,6 +770,7 @@ def _restore_frame(rig, frame):
             solver.restore(b, snap)
     rig.key = key
     rig.approx = approx
+    rig.approx_since = None  # a guessed frame from the cache, no telling how far off it is
 
 
 def _trim_cache(rt, rig, frame):
@@ -843,10 +854,16 @@ def _max_skip(scene, playing, rendering):
     return MAX_SKIP
 
 
-def _decide(scene, s, rig, frame, playing, rendering=False):
-    """(CACHE|RESET|SAME, frame) or (SIM, frame, frames to advance, looped, restart from frame)."""
+def _decide(scene, s, rig, frame, playing, rendering=False, continuing=False):
+    """(CACHE|RESET|SAME, frame) or (SIM, frame, frames to advance, looped, restart from frame).
+
+    continuing: playback comes straight from the frame this rig was last on, however many
+    frames Blender skipped (a slow frame can skip more than a second's worth).
+    """
+    rig.why = ""
     entry = rig.cache.get(frame)
     if not rig.ready:
+        rig.why = "not set up yet"
         return (CACHE, frame) if entry is not None else (RESET, frame)
     last = rig.last_frame
     if frame == last:
@@ -858,7 +875,7 @@ def _decide(scene, s, rig, frame, playing, rendering=False):
     wrap = False
     restart = None
     if last is not None:
-        if 0 < frame - last <= most:
+        if 0 < frame - last <= most or (continuing and frame > last):
             k = frame - last
         elif playing and frame < last:
             # only real playback loops around, a render or a jump back to the start doesn't
@@ -876,11 +893,22 @@ def _decide(scene, s, rig, frame, playing, rendering=False):
         if entry is not None and restart is None:
             if entry[0] == rig.key and (not wrap or rig.key == rig.converged_key):
                 return (CACHE, frame)  # replaying the same run, or a loop that settled into a repeat
-            if rig.approx and not entry[2] and not wrap:
-                return (CACHE, frame)  # back onto an exact run after skipping frames
+            # Back onto the exact run after skipping a few frames. Only the run the guesses came
+            # from, and only soon after: another run (the background cache starts from the first
+            # frame, playback may have started from rest somewhere else) looks like a reset.
+            if (rig.approx and not entry[2] and not wrap and entry[0] == exact_run(rig.key)
+                    and rig.approx_since is not None and frame - rig.approx_since <= most):
+                rig.why = "back on the exact run"
+                return (CACHE, frame)
         return (SIM, frame, k, wrap, restart)
     if entry is not None and s.use_cache:
         return (CACHE, frame)
+    if last is None:
+        rig.why = "first frame"
+    elif playing:
+        rig.why = f"playback went from frame {last} to {frame}"
+    else:
+        rig.why = f"jumped from frame {last}"
     return (RESET, frame)
 
 
@@ -1004,7 +1032,9 @@ def frame_pre(scene):
     sub = scene.frame_current_final - frame
     rendering = rt.rendering or not _on_main_thread()
     playing = rt.force_fast or (not rendering and _is_playing())
-    if playing and not rendering and not rt.force_fast and frame != rt.last_play_frame:
+    live_play = playing and not rendering and not rt.force_fast
+    prev_play = rt.last_play_frame
+    if live_play and frame != rt.last_play_frame:
         _time_playback(rt, frame)
     # Fast Preview only while the viewport plays, never for renders
     fast_allowed = s.fast_preview and playing and not rendering
@@ -1022,7 +1052,8 @@ def frame_pre(scene):
             for b in rig.bones:
                 writer.show(b, _subframe_delta(rig, b, frame, sub))
             continue
-        decision = _decide(scene, s, rig, frame, playing, rendering)
+        continuing = live_play and prev_play is not None and rig.last_frame == prev_play
+        decision = _decide(scene, s, rig, frame, playing, rendering, continuing)
         rig.pending = decision
         rig.fast = fast_allowed and rig.fast_ok and decision[0] == SIM
         snaps = rig.cache[frame][1] if decision[0] == CACHE else None
@@ -1269,10 +1300,12 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
         _restore_frame(rig, frame)
         rig.last_frame = frame
         rig.ready = all(b.ready for b in rig.bones)
-        history.append((frame, rig.name, "cache"))
+        history.append((frame, rig.name, "cache" + (f", {rig.why}" if rig.why else "")))
         return world
 
     what = mode.lower()
+    if mode == RESET and rig.why:
+        what += f" ({rig.why})"
     if mode == SIM and decision[4] is not None:
         _restore_frame(rig, decision[4])  # looped while dropping frames, go on from the first frame
         what += f", from frame {decision[4]}"
@@ -1290,6 +1323,7 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
                 what += f", preroll {done}/{total} steps"
             rig.key = reset_key(frame, s)
             rig.approx = False
+            rig.approx_since = None
             rig.converged_key = None
             rig.ready = True
         else:
@@ -1311,7 +1345,9 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
                     rig.approx = rig.approx or k > 1
             elif k > 1:
                 # the frames in between were guessed, keep this run apart from exact ones
-                rig.key = rt.new_key("skip")
+                rig.key = rt.new_key("skip", exact_run(rig.key))
+                if not rig.approx:
+                    rig.approx_since = frame
                 rig.approx = True
 
     bad = blown_bones(rig)

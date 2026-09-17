@@ -4,7 +4,7 @@ Emil's Wiggle - sidebar panels (View3D > Sidebar > Emil).
 
 import bpy
 
-from . import background, debug, handlers, legacy, runtime
+from . import background, debug, groups, handlers, legacy, runtime
 
 
 class EmilsWigglePanel:
@@ -153,10 +153,61 @@ class EMILSWIGGLE_PT_main(EmilsWigglePanel, bpy.types.Panel):
         icon = "HIDE_ON" if pb.emils_wiggle.mute else "BONE_DATA"
         row.prop(pb.emils_wiggle, "mute", icon=icon, icon_only=True, invert_checkbox=True, emboss=False)
         row.label(text="Bone muted" if pb.emils_wiggle.mute else pb.name)
+        group = groups.find(ob, pb.emils_wiggle.group)
+        if group is not None:
+            layout.label(text=f"In {group.name}", icon="GROUP_BONE")
         if rt_rig is not None and pb.name in rt_rig.blowup_bones:
             draw_lines(layout, "ERROR", "This bone blew up", "see its warnings below")
         if min(abs(v) for v in pb.scale) < 1e-6:
             draw_lines(layout, "ERROR", "Bone scaled to 0", "it can't wiggle")
+
+
+_counts = {}  # group uid -> bone count, filled by the panel right before the list draws
+
+
+class EMILSWIGGLE_UL_groups(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index=0):
+        row = layout.row(align=True)
+        row.prop(item, "name", text="", emboss=False, icon="GROUP_BONE")
+        sub = row.row(align=True)
+        sub.alignment = "RIGHT"
+        sub.label(text=str(_counts.get(item.uid, 0)))
+
+
+class EMILSWIGGLE_PT_groups(EmilsWigglePanel, bpy.types.Panel):
+    bl_label = "Wiggle Groups"
+    bl_parent_id = "EMILSWIGGLE_PT_main"
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.object
+        return (context.scene.emils_wiggle.enabled and context.mode == "POSE"
+                and ob is not None and ob.type == "ARMATURE" and ob.pose is not None)
+
+    def draw(self, context):
+        layout = self.layout
+        ob = context.object
+        s = ob.emils_wiggle
+        _counts.clear()
+        _counts.update(groups.counts(ob))
+        row = layout.row()
+        row.template_list("EMILSWIGGLE_UL_groups", "", s, "groups", s, "active_group", rows=3)
+        col = row.column(align=True)
+        col.operator("emils_wiggle.group_add", icon="ADD", text="")
+        col.operator("emils_wiggle.group_remove", icon="REMOVE", text="")
+        if not s.groups:
+            draw_lines(layout, "INFO", "Select bones and press +", "to make a group")
+            return
+        row = layout.row(align=True)
+        row.operator("emils_wiggle.group_assign", text="Assign")
+        row.operator("emils_wiggle.group_unassign", text="Remove")
+        row = layout.row(align=True)
+        row.operator("emils_wiggle.group_select", text="Select")
+        row.operator("emils_wiggle.group_deselect", text="Deselect")
+        scene_s = context.scene.emils_wiggle
+        if not scene_s.edit_selected:
+            draw_lines(layout, "INFO", "Edits only change", "the active bone")
+            layout.prop(scene_s, "edit_selected")
 
 
 class EMILSWIGGLE_PT_tail(EmilsWigglePanel, bpy.types.Panel):
@@ -329,7 +380,9 @@ class EMILSWIGGLE_PT_debug(EmilsWigglePanel, bpy.types.Panel):
 
 
 classes = (
+    EMILSWIGGLE_UL_groups,
     EMILSWIGGLE_PT_main,
+    EMILSWIGGLE_PT_groups,
     EMILSWIGGLE_PT_tail,
     EMILSWIGGLE_PT_head,
     EMILSWIGGLE_PT_simulation,

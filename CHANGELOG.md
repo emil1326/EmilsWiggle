@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.0 (2026-09-16)
+
+Wiggle Groups, and clicking bones doesn't nuke the cache anymore.
+
+- Wiggle Groups: a list of named bone selections per armature, in pose mode. Click a group and its bones get selected, then the usual Tail/Head settings edit all of them at once (with Edit All Selected on). A bone is in one group at most. Add, remove, assign, remove from group, select and deselect buttons, and the main panel shows which group the active bone is in.
+- Selecting, deselecting or hiding bones in pose mode, or clicking a group, cleared the whole cache because Blender reports it like an edit of the armature. The add-on now compares the pose, the rest bones, the object matrix and the constraints, and only a real change clears the cache.
+- Copy Settings to Selected doesn't move bones between groups.
+- The debug report lists the groups and which group every wiggle bone is in.
+
 ## 1.2.0 (2026-09-16)
 
 Background caching, and slow playback that doesn't fall apart.

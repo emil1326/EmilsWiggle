@@ -10,14 +10,16 @@ import bpy
 from bpy.props import (
     BoolProperty,
     BoolVectorProperty,
+    CollectionProperty,
     EnumProperty,
     FloatProperty,
     FloatVectorProperty,
     IntProperty,
     PointerProperty,
+    StringProperty,
 )
 
-from . import runtime
+from . import groups, runtime
 
 OVR = {"LIBRARY_OVERRIDABLE"}
 
@@ -207,10 +209,20 @@ class EmilsWiggleBoneSettings(bpy.types.PropertyGroup):
                            default=False, override=OVR, update=_upd("use_head", structure=True))
     tail: PointerProperty(type=EmilsWiggleSideSettings, override=OVR)
     head: PointerProperty(type=EmilsWiggleSideSettings, override=OVR)
+    # no update callback: which group a bone is in doesn't change the simulation
+    group: IntProperty(name="Wiggle Group", description="Number of the Wiggle Group this bone is in, 0 for none",
+                       default=0, min=0, override=OVR)
 
 
 def _upd_object(self, context):
     _settings_changed(context, structure=True)
+
+
+class EmilsWiggleGroup(bpy.types.PropertyGroup):
+    """A named set of bones, only there to select them together."""
+    name: StringProperty(name="Name", default="Group", override=OVR, update=groups.on_renamed)
+    uid: IntProperty(name="Number", description="What the bones in this group point at",
+                     default=0, override=OVR)
 
 
 class EmilsWiggleObjectSettings(bpy.types.PropertyGroup):
@@ -218,6 +230,9 @@ class EmilsWiggleObjectSettings(bpy.types.PropertyGroup):
                        default=False, override=OVR, update=_upd_object)
     freeze: BoolProperty(name="Freeze", description="Wiggle is frozen because this armature was baked",
                          default=False, override=OVR, update=_upd_object)
+    groups: CollectionProperty(type=EmilsWiggleGroup, override={"LIBRARY_OVERRIDABLE", "USE_INSERTION"})
+    active_group: IntProperty(name="Active Wiggle Group", description="Clicking a group selects its bones",
+                              default=0, min=0, override=OVR, update=groups.on_active_changed)
 
 
 def _upd_scene_enable(self, context):
@@ -280,6 +295,7 @@ class EmilsWiggleSceneSettings(bpy.types.PropertyGroup):
 classes = (
     EmilsWiggleSideSettings,
     EmilsWiggleBoneSettings,
+    EmilsWiggleGroup,
     EmilsWiggleObjectSettings,
     EmilsWiggleSceneSettings,
 )

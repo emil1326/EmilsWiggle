@@ -9,7 +9,7 @@
 bl_info = {
     "name": "Emil's Wiggle",
     "author": "Emil (fork of Wiggle 2 by Steve Miller)",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Emil",
     "description": "Spring physics on bones that works live and in renders, no baking needed",
@@ -19,12 +19,12 @@ bl_info = {
 
 if "bpy" in locals():
     import importlib
-    for _mod in (solver, runtime, background, props, handlers, operators, debug, legacy, ui):  # noqa: F821
+    for _mod in (solver, runtime, background, groups, props, handlers, operators, debug, legacy, ui):  # noqa: F821
         importlib.reload(_mod)
 
 import bpy
 
-from . import solver, runtime, background, props, handlers, operators, debug, legacy, ui
+from . import solver, runtime, background, groups, props, handlers, operators, debug, legacy, ui
 
 
 def _detect_later():

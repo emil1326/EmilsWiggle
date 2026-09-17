@@ -731,6 +731,63 @@ def act_wiggle2_leftovers():
         legacy.clean_dangling_wiggle2()
 
 
+def _group_op(name):
+    op = getattr(bpy.ops.emils_wiggle, name)
+    try:
+        if GUI:
+            with bpy.context.temp_override(**ctx()):
+                if op.poll():
+                    op()
+        elif op.poll():
+            op()
+    except Exception:
+        problem(f"Wiggle Group operator {name} failed: {traceback.format_exc()[-300:]}")
+
+
+def act_groups():
+    from EmilsWiggle import groups
+    ob = pick(armatures())
+    if ob is None or not set_active(ob):
+        return
+    ensure_object_mode()
+    mode_set("POSE")
+    try:
+        s = ob.emils_wiggle
+        for pb in ob.pose.bones:
+            if rng.random() < 0.3:
+                pb.bone.select = not pb.bone.select
+            if rng.random() < 0.05:
+                pb.bone.hide = not pb.bone.hide
+        if len(ob.data.bones) and rng.random() < 0.5:
+            ob.data.bones.active = pick(ob.data.bones)
+        kind = rng.random()
+        if kind < 0.2 or not s.groups:
+            _group_op("group_add")
+        elif kind < 0.3:
+            _group_op("group_remove")
+        elif kind < 0.45:
+            _group_op("group_assign")
+        elif kind < 0.55:
+            _group_op("group_unassign")
+        elif kind < 0.7 and runtime._editable(ob):
+            index = rng.randrange(len(s.groups) + 2)  # past the end too
+            s.active_group = index
+            g = groups.active(ob)
+            if g is not None:
+                want = sorted(pb.name for pb in groups.members(ob, g.uid) if groups.visible(pb))
+                got = sorted(pb.name for pb in ob.pose.bones if pb.bone.select and groups.visible(pb))
+                if want != got:
+                    problem(f"picking group {g.name} selected {got}, expected {want}")
+        elif kind < 0.8 and runtime._editable(ob):
+            pick(s.groups).name = rng.choice(["", "Hair", "Hair", "x" * 70, "Ünïcödé"])
+        elif kind < 0.9:
+            _group_op(rng.choice(["group_select", "group_deselect"]))
+        elif runtime._editable(ob) and len(ob.pose.bones):
+            pick(ob.pose.bones).emils_wiggle.group = rng.randint(0, 50)  # groups that may not exist
+    finally:
+        ensure_object_mode()
+
+
 def act_mode_switch():
     ob = pick(armatures())
     if ob is None or not set_active(ob):
@@ -747,7 +804,7 @@ ACTIONS = [
     (act_frames, 25), (act_timing, 3), (act_transform_rig, 4), (act_pose_bone, 4),
     (act_edit_bones, 5), (act_collider_wind_pin, 5), (act_delete_thing, 5), (act_operators, 4),
     (act_view_layers, 2), (act_scenes, 2), (act_render, 3), (act_reload, 1), (act_addon_toggle, 1),
-    (act_wiggle2_leftovers, 1), (act_mode_switch, 3), (act_export, 1), (act_parent_rig, 2),
+    (act_wiggle2_leftovers, 1), (act_mode_switch, 3), (act_groups, 5), (act_export, 1), (act_parent_rig, 2),
     (act_library, 1), (act_viewport_render, 1 if GUI else 0), (act_view_layer_switch, 1 if GUI else 0),
     (act_background, 0 if GUI else 3), (act_sit_still, 6 if GUI else 0),
     (act_undo, 6 if GUI else 0), (act_undo_push, 4 if GUI else 0), (act_playback, 6 if GUI else 0),

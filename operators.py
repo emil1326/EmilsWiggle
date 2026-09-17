@@ -7,7 +7,7 @@ import time
 import bpy
 from bpy.props import BoolProperty
 
-from . import props, runtime
+from . import groups, props, runtime
 
 
 def _wiggle_rig(context):
@@ -26,7 +26,7 @@ def _wiggle_rig(context):
 def _copy_group(src, dst):
     for p in src.bl_rna.properties:
         pid = p.identifier
-        if pid in {"rna_type", "name"}:
+        if pid in {"rna_type", "name", "group"}:  # copying settings doesn't move bones between groups
             continue
         value = getattr(src, pid)
         if isinstance(value, bpy.types.PropertyGroup):
@@ -100,6 +100,98 @@ class EMILSWIGGLE_OT_select(bpy.types.Operator):
                 s = pb.emils_wiggle
                 if not s.mute and (s.use_tail or (s.use_head and not pb.bone.use_connect)):
                     pb.bone.select = True
+        return {"FINISHED"}
+
+
+def _group_rig(context):
+    """The armature in pose mode whose Wiggle Groups can be edited, or None."""
+    ob = context.object
+    if (context.mode != "POSE" or ob is None or ob.type != "ARMATURE" or ob.pose is None
+            or not runtime._editable(ob)):
+        return None
+    return ob
+
+
+class _GroupOperator:
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        ob = _group_rig(context)
+        return ob is not None and groups.active(ob) is not None
+
+
+class EMILSWIGGLE_OT_group_add(bpy.types.Operator):
+    """Make a new Wiggle Group with the selected bones in it"""
+    bl_idname = "emils_wiggle.group_add"
+    bl_label = "Add Wiggle Group"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return _group_rig(context) is not None
+
+    def execute(self, context):
+        ob = _group_rig(context)
+        g = groups.new_group(ob)
+        groups.assign(context, ob, g.uid)
+        return {"FINISHED"}
+
+
+class EMILSWIGGLE_OT_group_remove(_GroupOperator, bpy.types.Operator):
+    """Delete the active Wiggle Group. Its bones and their settings stay as they are"""
+    bl_idname = "emils_wiggle.group_remove"
+    bl_label = "Remove Wiggle Group"
+
+    def execute(self, context):
+        ob = _group_rig(context)
+        if not groups.remove_group(ob, ob.emils_wiggle.active_group):
+            self.report({"WARNING"}, "This group comes from the linked file, it can only be removed there")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class EMILSWIGGLE_OT_group_assign(_GroupOperator, bpy.types.Operator):
+    """Put the selected bones in the active Wiggle Group (they leave the group they were in)"""
+    bl_idname = "emils_wiggle.group_assign"
+    bl_label = "Assign to Wiggle Group"
+
+    def execute(self, context):
+        ob = _group_rig(context)
+        groups.assign(context, ob, groups.active(ob).uid)
+        return {"FINISHED"}
+
+
+class EMILSWIGGLE_OT_group_unassign(_GroupOperator, bpy.types.Operator):
+    """Take the selected bones out of the active Wiggle Group"""
+    bl_idname = "emils_wiggle.group_unassign"
+    bl_label = "Remove from Wiggle Group"
+
+    def execute(self, context):
+        ob = _group_rig(context)
+        groups.unassign(context, ob, groups.active(ob).uid)
+        return {"FINISHED"}
+
+
+class EMILSWIGGLE_OT_group_select(_GroupOperator, bpy.types.Operator):
+    """Select the bones of the active Wiggle Group, and only those"""
+    bl_idname = "emils_wiggle.group_select"
+    bl_label = "Select Wiggle Group"
+
+    def execute(self, context):
+        ob = _group_rig(context)
+        groups.select(context, ob, groups.active(ob).uid)
+        return {"FINISHED"}
+
+
+class EMILSWIGGLE_OT_group_deselect(_GroupOperator, bpy.types.Operator):
+    """Deselect the bones of the active Wiggle Group"""
+    bl_idname = "emils_wiggle.group_deselect"
+    bl_label = "Deselect Wiggle Group"
+
+    def execute(self, context):
+        ob = _group_rig(context)
+        groups.deselect(ob, groups.active(ob).uid)
         return {"FINISHED"}
 
 
@@ -333,6 +425,12 @@ classes = (
     EMILSWIGGLE_OT_reset,
     EMILSWIGGLE_OT_copy,
     EMILSWIGGLE_OT_select,
+    EMILSWIGGLE_OT_group_add,
+    EMILSWIGGLE_OT_group_remove,
+    EMILSWIGGLE_OT_group_assign,
+    EMILSWIGGLE_OT_group_unassign,
+    EMILSWIGGLE_OT_group_select,
+    EMILSWIGGLE_OT_group_deselect,
     EMILSWIGGLE_OT_simulate,
     EMILSWIGGLE_OT_clear_cache,
     EMILSWIGGLE_OT_lock_interface,

@@ -336,6 +336,52 @@ def steps():
     here.frame_end = 24
     here.sync_mode = sync
 
+    # --- Wiggle Groups in a real window: picking a group or bones leaves the cache alone
+    from EmilsWiggle import groups
+    rig_ob = bpy.data.objects["Rig"]
+    bpy.context.view_layer.objects.active = rig_ob
+    with bpy.context.temp_override(**ctx()):
+        bpy.ops.object.mode_set(mode="POSE")
+    tips = groups.new_group(rig_ob, "Tips")
+    for name in ("w1", "w2"):
+        rig_ob.pose.bones[name].emils_wiggle.group = tips.uid
+    runtime.invalidate_scene(here, force=True)
+    for f in range(1, 25):
+        here.frame_set(f)
+    here.frame_set(12)
+    yield 0.5
+    rt2.counts.clear()
+    for pb in rig_ob.pose.bones:
+        pb.bone.select = False
+    rig_ob.emils_wiggle.active_group = 0  # what a click in the list does
+    yield 0.5
+    picked = sorted(pb.name for pb in rig_ob.pose.bones if pb.bone.select)
+    check("picking a group in a real window selects its bones", picked == ["w1", "w2"], f"{picked}")
+    with bpy.context.temp_override(**ctx()):
+        bpy.ops.pose.select_all(action="SELECT")
+    yield 0.5
+    with bpy.context.temp_override(**ctx()):
+        bpy.ops.emils_wiggle.group_select()
+    yield 0.5
+    count = runtime.cache_info(here)[0]
+    check("and neither that nor selecting bones clears the cache", count == 24 and rt2.counts["clicks ignored"] >= 3,
+          f"{count} {dict(rt2.counts)}")
+    with bpy.context.temp_override(**ctx()):
+        bpy.ops.screen.animation_play()
+    yield 1.0
+    with bpy.context.temp_override(**ctx()):
+        bpy.ops.screen.animation_cancel(restore_frame=False)
+    yield 0.3
+    rig_ob.pose.bones["w1"].rotation_quaternion = (1.0, 0.1, 0.0, 0.0)
+    yield 0.5
+    count = runtime.cache_info(here)[0]
+    check("playing in pose mode works and posing a bone still clears the cache",
+          count < 24 and not rt2.counts.get("errors"), f"{count} {dict(rt2.counts)}")
+    rig_ob.pose.bones["w1"].rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+    with bpy.context.temp_override(**ctx()):
+        bpy.ops.object.mode_set(mode="OBJECT")
+    yield 0.3
+
     # --- New Scene > Full Copy: the window switches to a scene whose depsgraph was built but never
     # evaluated, then the frame handlers run. The copied rig needs its own empties, and making them
     # in frame_change_pre crashed Blender 3.6 in the depsgraph rebuild right after.

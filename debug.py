@@ -12,7 +12,7 @@ import time
 import bpy
 from bpy.props import BoolProperty, IntProperty
 
-from . import handlers, runtime
+from . import groups, handlers, runtime
 
 force_show = False  # tests draw the debug panel without an installed add-on
 
@@ -199,6 +199,11 @@ def build_report(context):
                 f" blew up {rig.blowups}x (last frame {rig.blowup_frame}, {rig.blowup_bones[:6]}),"
                 f" colliders {sorted(rig.colliders) or '-'}, winds {sorted(rig.winds) or '-'}")
             ob = scene.objects.get(rig.name)
+            if ob is not None and ob.emils_wiggle.groups:
+                sizes = groups.counts(ob)
+                lines.append("    wiggle groups: " + ", ".join(
+                    f"{g.name} #{g.uid} ({sizes.get(g.uid, 0)})" for g in ob.emils_wiggle.groups)
+                    + f", active {ob.emils_wiggle.active_group}")
             for b in rig.bones:
                 pb = ob.pose.bones.get(b.name) if ob is not None else None
                 if pb is None:
@@ -208,6 +213,9 @@ def build_report(context):
                 extra = []
                 if b.helper is None:
                     extra.append("NO HELPER")
+                if pb.emils_wiggle.group:
+                    group = groups.find(ob, pb.emils_wiggle.group)
+                    extra.append(f"group {group.name if group is not None else 'missing'} #{pb.emils_wiggle.group}")
                 others = [c.type for c in pb.constraints if c.name != runtime.CONSTRAINT_NAME]
                 if others:
                     extra.append("constraints " + "/".join(others))

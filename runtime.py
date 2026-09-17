@@ -37,6 +37,7 @@ import math
 import threading
 import time
 import traceback
+from array import array
 from collections import Counter, deque
 
 import bpy
@@ -91,6 +92,10 @@ class RigRuntime:
         self.blowups = 0  # times the sim blew up and started over, for the panel
         self.blowup_frame = None
         self.blowup_bones = []
+        self.pose_state = None  # pose mode only: what a click could change, see _only_clicked
+        self.rest_state = None
+        self.pick_state = None
+        self.constraint_state = None
         self.pending = None
         self.pre_applied = set()
 
@@ -1246,8 +1251,12 @@ def frame_post(scene, depsgraph):
                 traceback.print_exc()
     finally:
         writer.flush()
-    if refreshed and depsgraph.mode == "VIEWPORT" and _on_main_thread():
-        _colliders_changed(scene, rt, depsgraph)  # what later collection updates get compared with
+    if depsgraph.mode == "VIEWPORT" and _on_main_thread():
+        if refreshed:
+            _colliders_changed(scene, rt, depsgraph)  # what later collection updates get compared with
+        if not rt.rendering:
+            for rig, ob, _ob_eval, _decision in work:
+                _remember_pose(rig, ob)  # the frame moved the pose, clicks get compared with this
     rt.stats_sim_ms = (time.perf_counter() - t0) * 1000.0
 
 
@@ -1337,20 +1346,117 @@ def _step_rig(scene, s, rt, rig, ob_eval, decision, depsgraph, world, work, writ
     return world
 
 
+# ---------------------------------------------------------------- clicks in pose mode
+# Selecting or hiding a bone tags the armature like a real edit would, and so does any
+# click on one of our own properties in the sidebar (Blender tags the owner of every
+# add-on property edited from the UI). That used to wipe the cache on every click.
+# So while a rig is in pose mode we remember its pose values, rest bones, object matrix
+# and selection. An update where only the selection changed, or only a Wiggle Group got
+# picked or renamed (note_click), gets ignored. Anything we can't compare (a constraint's
+# influence...) never comes together with one of those, so it still clears the cache.
+
+_POSE_VALUES = (("location", 3), ("rotation_quaternion", 4), ("rotation_euler", 3),
+                ("rotation_axis_angle", 4), ("scale", 3))
+_PICK_FLAGS = ("select", "select_head", "select_tail", "hide")
+_clicked = set()  # armatures whose Wiggle Groups got clicked or renamed since the last update
+
+
+def note_click(ob):
+    """One of our sidebar properties on this armature changed, nothing the simulation reads."""
+    _clicked.add(ob.as_pointer())
+
+
+def _floats(collection, prop, size):
+    buf = array("f", [0.0]) * (size * len(collection))
+    collection.foreach_get(prop, buf)
+    return buf.tobytes()
+
+
+def _pose_state(ob):
+    """What changes from frame to frame: pose values and the object matrix."""
+    matrix = array("f", [v for row in ob.matrix_world for v in row]).tobytes()
+    bones = ob.pose.bones
+    return matrix + b"".join(_floats(bones, name, size) for name, size in _POSE_VALUES)
+
+
+def _pick_state(ob):
+    bones = ob.data.bones
+    flags = []
+    for name in _PICK_FLAGS:
+        values = [False] * len(bones)
+        bones.foreach_get(name, values)
+        flags += values
+    active = bones.active
+    return active.name if active is not None else None, bytes(flags)
+
+
+def forget_selection(rig):
+    rig.pose_state = rig.rest_state = rig.pick_state = rig.constraint_state = None
+
+
+def _constraint_state(ob):
+    """Bone constraints and rotation modes, minus values that get animated (those can't
+    come in the same update as a click anyway)."""
+    out = []
+    for pb in ob.pose.bones:
+        out.append(pb.rotation_mode)
+        for c in pb.constraints:
+            target = getattr(c, "target", None)
+            out.append((pb.name, c.name, c.type, c.mute, c.owner_space, c.target_space,
+                        target.as_pointer() if target is not None else 0, getattr(c, "subtarget", "")))
+    return out
+
+
+def _remember_pose(rig, ob, full=False):
+    """full: also what only changes with an edit (rest bones, selection, constraints). A frame
+    change only needs the pose part, that keeps playback in pose mode cheap."""
+    if ob.mode != "POSE" or ob.pose is None:
+        forget_selection(rig)
+        return
+    rig.pose_state = _pose_state(ob)
+    if full or rig.rest_state is None:
+        rig.rest_state = _floats(ob.data.bones, "matrix_local", 16)
+        rig.pick_state = _pick_state(ob)
+        rig.constraint_state = _constraint_state(ob)
+
+
+def _only_clicked(scene, rig, clicked):
+    """True when the rig's update was only a click: bones (de)selected or hidden, or a Wiggle
+    Group picked or renamed. Remembers the new state either way."""
+    ob = scene.objects.get(rig.name)
+    if ob is None or ob.as_pointer() != rig.ptr:
+        forget_selection(rig)
+        return False
+    before = (rig.pose_state, rig.rest_state, rig.pick_state, rig.constraint_state)
+    _remember_pose(rig, ob, full=True)
+    if before[0] is None or rig.pose_state is None:
+        return False
+    if (rig.pose_state != before[0] or rig.rest_state != before[1] or rig.constraint_state != before[3]
+            or _rig_signature(ob) != rig.signature):
+        return False
+    return clicked or rig.pick_state != before[2]
+
+
 # ---------------------------------------------------------------- app events
 
 def on_depsgraph_update(scene, depsgraph):
+    clicked = set(_clicked)  # only good for the update right after the click
+    _clicked.clear()
     if not scene.emils_wiggle.enabled:
         return
     rt = peek(scene)
     if rt is None:
         return
     if bpy.app.is_job_running("RENDER"):
+        for rig in rt.rigs.values():
+            forget_selection(rig)  # whatever gets clicked meanwhile isn't compared
         return
     if rt.rendering:
         rt.rendering = False  # a render ended without telling us, don't stay stuck
     view_layer = getattr(bpy.context, "view_layer", None)
     if view_layer is not None and depsgraph.view_layer.name != view_layer.name:
+        for rig in rt.rigs.values():
+            forget_selection(rig)
         return
     _check_scene_settings(scene, rt)
     if rt.needs_edit or _stale(scene, rt):
@@ -1379,11 +1485,18 @@ def on_depsgraph_update(scene, depsgraph):
             orig = idd.original
             if not _is_helper(orig) and (u.is_updated_transform or u.is_updated_geometry):
                 touched.add(orig.name)
-    if armatures:
-        for rig in rt.rigs.values():
-            ob = scene.objects.get(rig.name)
-            if ob is not None and ob.data is not None and ob.data.as_pointer() in armatures:
+    rig_data = {}
+    for rig in rt.rigs.values():
+        ob = scene.objects.get(rig.name)
+        if ob is not None and ob.data is not None:
+            rig_data[rig.name] = ob.data.as_pointer()
+            if rig_data[rig.name] in armatures:
                 touched.add(rig.name)
+    for rig in rt.rigs.values():
+        if rig.name in touched and _only_clicked(scene, rig, rig.ptr in clicked):
+            touched.discard(rig.name)
+            armatures.discard(rig_data.get(rig.name))
+            rt.counts["clicks ignored"] += 1
     if rt.own_writes and touched and touched <= rt.own_writes and not (armatures or action_changed
                                                                          or collections_changed):
         # just the viewport catching up with empties we moved ourselves
@@ -1420,6 +1533,7 @@ def after_undo():
         for rig in rt.rigs.values():
             rig.settings_dirty = True
             rig.anim_dirty = True
+            forget_selection(rig)  # undo can bring back a selection and an edit together
             invalidate(rig, scene=scene)
             for b in rig.bones:
                 b.helper = None  # the undo step may have swapped the objects

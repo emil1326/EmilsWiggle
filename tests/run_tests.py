@@ -619,6 +619,21 @@ class _MockLayout:
     def separator(self, **kw):
         pass
 
+    lists = set()
+
+    def template_list(self, listtype, list_id, data, prop, active_data, active_prop, **kw):
+        cls = getattr(bpy.types, listtype, None)
+        if cls is None or not issubclass(cls, bpy.types.UIList):
+            self.errors.append(f"missing list {listtype}")
+            return
+        for d, name in ((data, prop), (active_data, active_prop)):
+            if name not in d.bl_rna.properties:
+                self.errors.append(f"missing property {name} on {d.bl_rna.identifier}")
+                return
+        for i, item in enumerate(getattr(data, prop)):
+            cls.draw_item(None, bpy.context, _MockLayout(self.errors), data, item, 0, active_data, active_prop, i)
+        _MockLayout.lists.add(listtype)
+
 
 def test_ui_draw():
     import types
@@ -634,6 +649,8 @@ def test_ui_draw():
 
     def draw_all(ctx):
         for cls in ui.classes:
+            if not issubclass(cls, bpy.types.Panel):
+                continue
             if hasattr(cls, "poll") and not cls.poll(ctx):
                 continue
             fake = types.SimpleNamespace(layout=_MockLayout(errors))
@@ -652,6 +669,11 @@ def test_ui_draw():
     draw_all(ctx)  # nothing ticked yet
     s = pb.emils_wiggle
     s.use_tail = s.use_head = True
+    draw_all(ctx)  # no groups yet
+    from EmilsWiggle import groups
+    group = groups.new_group(ob, "Hair")
+    s.group = group.uid
+    ob.pose.bones["w2"].emils_wiggle.group = 42  # its group is gone
     s.tail.per_axis = True
     s.tail.collider = plane
     s.head.collider_type = "Collection"
@@ -672,6 +694,9 @@ def test_ui_draw():
     ob.emils_wiggle.freeze = True
     draw_all(ctx)
     ob.emils_wiggle.freeze = False
+    scene.emils_wiggle.edit_selected = False
+    draw_all(ctx)
+    scene.emils_wiggle.edit_selected = True
     draw_all(types.SimpleNamespace(scene=scene, object=None, active_pose_bone=None, mode="OBJECT",
                                    selected_pose_bones=None))
     check("every panel draws without bad names", not errors, "; ".join(sorted(set(errors)))[:300])
@@ -680,7 +705,9 @@ def test_ui_draw():
     check("debug report lists the rig, its bones and recent frames",
           "Rig: 1 bone (1 tail, 1 head)" in report and "w1 (wiggle parent -" in report
           and "tail: mass" in report and "head: mass" in report and "recent frames:" in report)
+    check("and the Wiggle Groups", "wiggle groups: Hair #1 (1)" in report and "group Hair #1" in report)
     debug.force_show = False
+    drawn |= _MockLayout.lists
     check("all panels got drawn at least once", drawn == {c.__name__ for c in ui.classes},
           f"missing {sorted({c.__name__ for c in ui.classes} - drawn)}")
 
@@ -1159,6 +1186,8 @@ def test_linked_and_overridden_rigs():
     ob = make_chain("Rig")
     scene.emils_wiggle.enabled = True
     enable(ob)
+    from EmilsWiggle import groups
+    ob.pose.bones["w0"].emils_wiggle.group = groups.new_group(ob, "Lib").uid
     play(scene, ob, range(1, 4))
     path = os.path.join(tempfile.mkdtemp(), "lib.blend")
     bpy.ops.wm.save_as_mainfile(filepath=path, copy=True)
@@ -1184,6 +1213,200 @@ def test_linked_and_overridden_rigs():
           over.name in rt.rigs and rt.counts.get("errors", 0) == 0,
           f"{set(rt.rigs)} errors {rt.counts.get('errors', 0)}: {runtime.last_error.strip()[-150:]}")
     check("the local look-alike is still there", bpy.data.objects.get("EmilsWiggle_Rig_w0") is not None)
+
+    bpy.context.view_layer.objects.active = over
+    bpy.ops.object.mode_set(mode="POSE")
+    s = over.emils_wiggle
+    check("the linked file's Wiggle Group comes along", [g.name for g in s.groups] == ["Lib"])
+    s.active_group = 0
+    picked = sorted(pb.name for pb in over.pose.bones if pb.bone.select)
+    for pb in over.pose.bones:
+        pb.bone.select = pb.name == "w2"
+    bpy.ops.emils_wiggle.group_add()
+    added = [(g.name, [pb.name for pb in groups.members(over, g.uid)]) for g in s.groups]
+    with groups.quiet():
+        s.active_group = 0
+    removed = bpy.ops.emils_wiggle.group_remove()
+    check("on an overridden rig groups select, get added, and a linked one can't be removed (no error)",
+          picked == ["w0"] and added == [("Lib", ["w0"]), ("Group", ["w2"])] and removed == {"CANCELLED"}
+          and len(s.groups) == 2, f"{picked} {added} {removed}")
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+
+def test_wiggle_groups():
+    from EmilsWiggle import groups
+    scene = fresh_scene()
+    ob = make_chain("Rig", n=4)
+    scene.emils_wiggle.enabled = True
+    scene.emils_wiggle.edit_selected = True
+    enable(ob)
+    bpy.context.view_layer.objects.active = ob
+    check("the group buttons only work in pose mode", not bpy.ops.emils_wiggle.group_add.poll())
+    bpy.ops.object.mode_set(mode="POSE")
+    bones = ob.pose.bones
+    arm = ob.data
+    s = ob.emils_wiggle
+
+    def pick(*names):
+        # like a click: rewriting the same selection would be an edit we can't tell apart
+        for pb in bones:
+            if pb.bone.select != (pb.name in names):
+                pb.bone.select = pb.name in names
+        if arm.bones.active != arm.bones[names[0]]:
+            arm.bones.active = arm.bones[names[0]]
+
+    def selected():
+        return sorted(pb.name for pb in bones if pb.bone.select)
+
+    def inside(g):
+        return sorted(pb.name for pb in groups.members(ob, g.uid))
+
+    def quietly_activate(index):
+        with groups.quiet():
+            s.active_group = index
+
+    pick("w0", "w1")
+    bpy.ops.emils_wiggle.group_add()
+    pick("w2", "w3")
+    bpy.ops.emils_wiggle.group_add()
+    hair, tail = s.groups
+    got = (hair.name, inside(hair), tail.name, inside(tail), s.active_group)
+    check("adding a group puts the selected bones in it",
+          got == ("Group", ["w0", "w1"], "Group.001", ["w2", "w3"], 1), f"{got}")
+    hair.name, tail.name = "Hair", "Tail"
+
+    pick("root")
+    s.active_group = 0  # what clicking it in the list does
+    check("clicking a group selects its bones, and only those, with one of them active",
+          selected() == ["w0", "w1"] and arm.bones.active.name == "w0", f"{selected()} {arm.bones.active.name}")
+    for pb in bones:
+        pb.bone.select = False
+    arm.bones.active = arm.bones["w1"]
+    s.active_group = 0
+    check("an active bone that's in the group stays active", arm.bones.active.name == "w1" and selected() == ["w0", "w1"])
+
+    bones["w1"].emils_wiggle.tail.stiff = 77.0
+    stiff = [round(bones[f"w{i}"].emils_wiggle.tail.stiff) for i in range(4)]
+    check("editing the active bone then edits the whole group, nothing else", stiff == [77, 77, 400, 400],
+          f"{stiff}")
+
+    quietly_activate(1)
+    pick("w1")
+    bpy.ops.emils_wiggle.group_assign()
+    check("a bone is in one group at most, assigning moves it",
+          inside(hair) == ["w0"] and inside(tail) == ["w1", "w2", "w3"], f"{inside(hair)} {inside(tail)}")
+    pick("w1", "w2")
+    bpy.ops.emils_wiggle.group_unassign()
+    check("removing takes the selected bones out", inside(tail) == ["w3"] and bones["w1"].emils_wiggle.group == 0)
+
+    bones["w3"].bone.hide = True
+    pick("w0")
+    bpy.ops.emils_wiggle.group_select()
+    check("hidden bones don't get selected", selected() == [] and arm.bones.active.name == "w0", f"{selected()}")
+    bones["w3"].bone.hide = False
+    bpy.ops.emils_wiggle.group_select()
+    check("the Select button selects the group", selected() == ["w3"] and arm.bones.active.name == "w3")
+    bpy.ops.emils_wiggle.group_deselect()
+    check("and Deselect deselects it", selected() == [])
+
+    tail.name = "Tips"
+    bones["w3"].name = "tip"
+    check("renaming the group or a bone keeps the bone in it", inside(tail) == ["tip"], f"{inside(tail)}")
+
+    pick("w0", "tip")
+    bpy.ops.emils_wiggle.copy()
+    check("Copy Settings to Selected leaves the groups alone",
+          bones["tip"].emils_wiggle.group == tail.uid and round(bones["tip"].emils_wiggle.tail.stiff) == 77)
+
+    pick("w0")
+    quietly_activate(0)
+    bpy.ops.emils_wiggle.group_remove()
+    check("removing a group keeps its bones, their settings and the selection",
+          [g.name for g in s.groups] == ["Tips"] and bones["w0"].emils_wiggle.group == 0
+          and round(bones["w0"].emils_wiggle.tail.stiff) == 77 and selected() == ["w0"] and s.active_group == 0)
+    bones["w2"].emils_wiggle.group = 9  # pointing at a group that's gone
+    new = groups.new_group(ob)
+    check("a new group never takes a number bones still point at", new.uid == 10 and groups.find(ob, 9) is None,
+          f"{new.uid}")
+    quietly_activate(0)
+
+    # selecting bones used to clear the whole cache (Blender tags the armature for it)
+    def cached_after(edit):
+        play(scene, ob, range(1, 11))
+        edit()
+        bpy.context.evaluated_depsgraph_get()
+        return runtime.cache_info(scene)[0]
+
+    def click_group():
+        pick("root")
+        s.active_group = 0
+
+    def select_all():
+        bpy.ops.pose.select_all(action="SELECT")
+
+    def click_bone():
+        pick("w1")
+
+    def hide_bone():
+        pick("w1")
+        bpy.ops.pose.hide()
+
+    def reveal_bones():
+        bpy.ops.pose.reveal(select=False)
+
+    def rename_group():
+        s.groups[0].name += "x"
+
+    def click_same_group():
+        s.active_group = 0  # its bones are already the selection
+
+    for label, edit in (("clicking a group", click_group), ("Select All", select_all),
+                        ("clicking a bone", click_bone), ("hiding bones", hide_bone),
+                        ("revealing them", reveal_bones), ("renaming a group", rename_group),
+                        ("clicking the group that's already picked", click_same_group)):
+        left = cached_after(edit)
+        check(f"{label} keeps the cache", left == 10, f"{left}")
+
+    def pose_bone():
+        bones["w1"].location.x += 0.3
+
+    def select_and_pose():
+        pick("w2")
+        bones["w2"].location.y += 0.2
+
+    def select_and_move_rig():
+        pick("w0")
+        ob.location.x += 0.5
+
+    def click_group_and_pose():
+        s.active_group = 0
+        bones["w1"].rotation_quaternion.x += 0.1
+
+    def click_group_and_constraint():
+        pick("root")
+        s.active_group = 0
+        c = bones["w1"].constraints.new("COPY_ROTATION")
+        c.influence = 0.0
+
+    def select_and_roll():
+        bpy.ops.object.mode_set(mode="EDIT")
+        arm.edit_bones["w2"].roll += 0.5
+        for eb in arm.edit_bones:
+            eb.select = eb.name == "w0"
+        bpy.ops.object.mode_set(mode="POSE")
+
+    for label, edit in (("posing a bone", pose_bone), ("selecting and posing at once", select_and_pose),
+                        ("selecting and moving the rig at once", select_and_move_rig),
+                        ("picking a group and posing at once", click_group_and_pose),
+                        ("picking a group and adding a constraint at once", click_group_and_constraint),
+                        ("selecting and rolling a bone in edit mode", select_and_roll)):
+        left = cached_after(edit)
+        check(f"{label} still clears the cache", left == 0, f"{left}")
+    bpy.ops.object.mode_set(mode="OBJECT")
+    left = cached_after(click_bone)
+    check("in object mode a selection change still counts as an edit (nothing to compare with)", left == 0,
+          f"{left}")
+    check("no errors", runtime.get(scene).counts.get("errors", 0) == 0, runtime.last_error[-200:])
 
 
 def _entry_diff(a, b):
@@ -1588,6 +1811,7 @@ def main():
     run(test_dropped_frames)
     run(test_huge_values)
     run(test_settings_warnings)
+    run(test_wiggle_groups)
     from EmilsWiggle import handlers
     check("no errors inside the handlers during the whole run (empty-mesh collider included)",
           handlers.error_count == 0, f"{handlers.error_count} errors, see the log")

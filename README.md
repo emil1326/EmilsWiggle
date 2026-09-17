@@ -20,6 +20,14 @@ Pretty much like Wiggle 2. Turn the scene on, select an armature, pick a pose bo
 
 Then just hit play.
 
+### Wiggle Groups
+
+Got an armature with a LOT of wiggle bones? In pose mode there's a **Wiggle Groups** list. Select some bones and hit **+**, that's a group. Click a group and all of its bones get selected (and one of them becomes the active bone), so the Tail/Head settings below are the group's settings, and since changing a value changes it on every selected bone, you're editing the whole group at once. That's really all it is, a saved selection. The settings stay on the bones.
+
+A bone is in one group at most, **Assign** moves the selected bones into the active group (out of whatever group they were in) and **Remove** takes them out. **Select** and **Deselect** do what they say, handy when the group is already the one highlighted in the list. Deleting a group doesn't touch its bones or their settings. Hidden bones don't get selected. They're called Wiggle Groups and not Bone Groups because Blender 3.6 already has Bone Groups (the colored ones), and these have nothing to do with those.
+
+Oh and clicking bones or groups doesn't clear the cache anymore. Blender reports a selection like any other change to the armature, so it used to throw every cached frame away on every click... Now the add-on checks whether anything besides the selection actually changed.
+
 ### Per axis values and locks
 
 Every Tail/Head section has a **Per Axis** toggle. Turn it on and Stiff, Damp and Gravity become X/Y/Z values in the bone's local space (it starts from whatever single value you had, so nothing jumps).
@@ -127,8 +135,9 @@ The code is split up like this:
 | `runtime.py` | Rigs, the frame logic, the cache, the constraints and empties |
 | `background.py` | The Background Cache and its hidden scene |
 | `props.py` | Every setting, saved in the .blend and library overridable |
+| `groups.py` | Wiggle Groups, named selections of bones |
 | `handlers.py` | Blender app handlers |
-| `operators.py` | Buttons: reset, simulate, bake, copy, select, import |
+| `operators.py` | Buttons: reset, simulate, bake, copy, select, import, Wiggle Groups |
 | `debug.py` | Developer Tools: the add-on preference, the debug report, the crash log |
 | `legacy.py` | Cleaning up what Wiggle 2 leaves behind when it gets turned off |
 | `ui.py` | The sidebar panels |
@@ -151,11 +160,11 @@ Two suites, both run with one command (plain Python, it finds Blender 3.6 by its
 python tests/run_all.py
 ```
 
-The background one builds rigs, plays them, renders with Cycles and Workbench, saves and reloads, bakes and draws every panel (146 passed last run on Blender 3.6.23). Background mode can't do real playback or threaded renders though, so the second one opens its own little Blender window, plays, stops, does a Ctrl+F12 with and without the cache plus an F12, copies and switches scenes, exports an Alembic in the background, sits still to let the Background Cache work, plays with frames dropping, checks everything and closes itself (33 passed). `--headless` or `--gui` runs just one of them, `-v` shows every check.
+The background one builds rigs, plays them, renders with Cycles and Workbench, saves and reloads, bakes, plays with Wiggle Groups and draws every panel (178 passed last run on Blender 3.6.23). Background mode can't do real playback or threaded renders though, so the second one opens its own little Blender window, plays, stops, does a Ctrl+F12 with and without the cache plus an F12, copies and switches scenes, exports an Alembic in the background, sits still to let the Background Cache work, plays with frames dropping, clicks Wiggle Groups, checks everything and closes itself (36 passed). `--headless` or `--gui` runs just one of them, `-v` shows every check.
 
 Every bug that gets fixed gets its own test in there too, so it can't sneak back in.
 
-Then there's the mean one, `python tests/run_all.py --stress`. It throws hundreds of random things at Blender with the add-on on: new and deleted rigs, renames, edit mode changes, crazy settings (zero scale, huge stiffness...), deleting colliders or even our own empties, scene copies, renders with motion blur or another scene in the compositor, Alembic and USD exports, linked and overridden rigs, rigs parented to other rigs, reloading the file or File > New, turning the add-on off and on, and in the GUI version also undo, redo, viewport renders and editing while the animation plays. The Background Cache runs between the actions the whole time. It also flags any single action that takes more than 5 seconds. Every action gets logged before it runs, so if something ever crashes the log says exactly what did it. `--seeds` and `--ops` make it longer.
+Then there's the mean one, `python tests/run_all.py --stress`. It throws hundreds of random things at Blender with the add-on on: new and deleted rigs, renames, edit mode changes, crazy settings (zero scale, huge stiffness...), deleting colliders or even our own empties, scene copies, renders with motion blur or another scene in the compositor, Alembic and USD exports, linked and overridden rigs, rigs parented to other rigs, Wiggle Groups getting made, deleted and renamed, reloading the file or File > New, turning the add-on off and on, and in the GUI version also undo, redo, viewport renders and editing while the animation plays. The Background Cache runs between the actions the whole time. It also flags any single action that takes more than 5 seconds. Every action gets logged before it runs, so if something ever crashes the log says exactly what did it. `--seeds` and `--ops` make it longer.
 
 `python tools/build_zip.py` makes the installable zip in `../dist`.
 
@@ -166,6 +175,8 @@ Then there's the mean one, `python tests/run_all.py --stress`. It throws hundred
 - A rig in a scene that was never shown in the viewport renders without wiggle if you render it straight away, since nothing can be created during a render (a compositor node pulling in another scene, for example). Look at that scene once first.
 - Linked armatures need a library override (Blender won't let anything add constraints otherwise).
 - Fast Preview is viewport playback only, on purpose.
+- A group that comes from the linked file of an overridden rig can't be deleted in your file (Blender doesn't allow it), new ones can be added and saved just fine.
+- Clicking bones only keeps the cache in pose mode. Selecting bones some other way (from the outliner in object mode, say) still clears it, there's nothing to compare with there.
 - Colliders keep colliding when you hide or exclude them, the settings point at them so Blender keeps them around. Clear the collider field to turn a collision off.
 
 ## Credits

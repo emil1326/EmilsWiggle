@@ -29,4 +29,5 @@ Emil tests in his real Blender 3.6, reports problems (often by pasting a Debug R
 - The GUI stress test pushes an undo step after every action like the UI does (`EMILS_WIGGLE_STRESS_NO_PUSH=1` turns that off, then Blender itself crashes on the scene links the actions make).
 - `runtime.invalidate` gives the live run a new key: the sim goes on from a state the new settings didn't produce, and those frames must never pass for `reset_key(start)`.
 - `frame_change_pre` gets no depsgraph in 3.6. Render animation calls the frame handlers once per view layer, and `scene.frame_set` calls them once per view layer too.
+- The UI calls the two bone ends **Swing** (identifier `tail`/`use_tail`) and **Jiggle** (`head`/`use_head`). Never rename the identifiers, saved files and overrides use them. Debug report and code keep tail/head.
 - Writing text (README, CHANGELOG, UI strings) follows Emil's voice from the global CLAUDE.md.

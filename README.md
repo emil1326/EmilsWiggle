@@ -16,13 +16,19 @@ Got a file that already uses Wiggle 2? There's an **Import Wiggle 2 Settings** b
 
 ## Using it
 
-Pretty much like Wiggle 2. Turn the scene on, select an armature, pick a pose bone and tick **Tail** (the bone swings) or **Head** (the bone moves, only on bones that aren't connected). Changing a value changes it on every selected bone too, you can turn that off in Utilities.
+Pretty much like Wiggle 2. Turn the scene on, select an armature, pick a pose bone and tick **Swing** or **Jiggle** (or both). Changing a value changes it on every selected bone too, you can turn that off in Utilities.
+
+**Swing** is Wiggle 2's Tail. The base of the bone stays where the animation puts it and the tip gets simulated, so the bone pivots and its tip lags behind. Hair, ears, tails, antennas, that kind of stuff.
+
+**Jiggle** is Wiggle 2's Head. The base of the bone gets simulated, like a weight on a spring tied to where the animation puts it, so the whole bone moves and bounces around its spot without turning. Belly, cheeks, something dangling. It only works on bones that aren't connected, a connected bone's base is glued to its parent's tip so it can't move on its own.
+
+**Chain** (on by default) makes a bone pull on the wiggling bone above it, split by their Mass, so a whole tail moves together and a heavy tip drags the rest. Turn it off and the bone still follows its parent but never pulls it back, handy for a little pompom or bell at the end of a chain that shouldn't yank everything around.
 
 Then just hit play.
 
 ### Wiggle Groups
 
-Got an armature with a LOT of wiggle bones? In pose mode there's a **Wiggle Groups** list. Select some bones and hit **+**, that's a group. Click a group and all of its bones get selected (and one of them becomes the active bone), so the Tail/Head settings below are the group's settings, and since changing a value changes it on every selected bone, you're editing the whole group at once. That's really all it is, a saved selection. The settings stay on the bones.
+Got an armature with a LOT of wiggle bones? In pose mode there's a **Wiggle Groups** list. Select some bones and hit **+**, that's a group. Click a group and all of its bones get selected (and one of them becomes the active bone), so the Swing/Jiggle settings below are the group's settings, and since changing a value changes it on every selected bone, you're editing the whole group at once. That's really all it is, a saved selection. The settings stay on the bones.
 
 A bone is in one group at most, **Assign** moves the selected bones into the active group (out of whatever group they were in) and **Remove** takes them out. **Select** and **Deselect** do what they say, handy when the group is already the one highlighted in the list. Deleting a group doesn't touch its bones or their settings. Hidden bones don't get selected. They're called Wiggle Groups and not Bone Groups because Blender 3.6 already has Bone Groups (the colored ones), and these have nothing to do with those.
 
@@ -30,9 +36,9 @@ Oh and clicking bones or groups doesn't clear the cache anymore. Blender reports
 
 ### Per axis values and locks
 
-Every Tail/Head section has a **Per Axis** toggle. Turn it on and Stiff, Damp and Gravity become X/Y/Z values in the bone's local space (it starts from whatever single value you had, so nothing jumps).
+Every Swing/Jiggle section has a **Per Axis** toggle. Turn it on and Stiff, Damp and Gravity become X/Y/Z values in the bone's local space (it starts from whatever single value you had, so nothing jumps).
 
-**Lock Axis** freezes motion along a local axis. For a tail that's X and Z (Y is along the bone, that's what Stretch is for). So an ear that should only flop sideways? Lock one axis and done. Turn on the bone axes display in the armature properties if you're not sure which one is which, bone roll decides it.
+**Lock Axis** freezes motion along a local axis. For Swing that's X and Z (Y is along the bone, that's what Stretch is for). So an ear that should only flop sideways? Lock one axis and done. Turn on the bone axes display in the armature properties if you're not sure which one is which, bone roll decides it.
 
 ### Rendering without baking
 
@@ -144,7 +150,7 @@ The code is split up like this:
 
 ## When something acts weird
 
-First, look at the panel. If a value makes no sense (Bounce or Friction over 1 with a collider, a gravity or wind that would throw the bone off, a bone or armature scaled to 0), the bone's Tail/Head section says so in red. It also tells you when Stiff or Damp are past the point where they change anything, since that depends on your frame rate, substeps and quality. And if the sim blows up anyway, it starts over from rest instead of sending bones to infinity, and the main panel shows how many times, on which frame and which bones.
+First, look at the panel. If a value makes no sense (Bounce or Friction over 1 with a collider, a gravity or wind that would throw the bone off, a bone or armature scaled to 0), the bone's Swing/Jiggle section says so in red. It also tells you when Stiff or Damp are past the point where they change anything, since that depends on your frame rate, substeps and quality. And if the sim blows up anyway, it starts over from rest instead of sending bones to infinity, and the main panel shows how many times, on which frame and which bones.
 
 Turn on **Developer Tools** in Preferences > Add-ons > Emil's Wiggle. A **Debug** panel shows up at the bottom, with counters (including why the cache got cleared), the playback fps and a **Copy Debug Report** button. The report has the settings of every wiggle bone, what the last frames did (cache, sim, fast preview, render...) and the last error, so paste that along with what you saw.
 

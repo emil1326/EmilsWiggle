@@ -220,7 +220,7 @@ class EMILSWIGGLE_PT_tail(EmilsWigglePanel, bpy.types.Panel):
         return _bone_ready(context)
 
     def draw_header(self, context):
-        self.layout.prop(context.active_pose_bone.emils_wiggle, "use_tail", text="Tail")
+        self.layout.prop(context.active_pose_bone.emils_wiggle, "use_tail", text="Swing")
 
     def draw(self, context):
         s = context.active_pose_bone.emils_wiggle
@@ -238,7 +238,7 @@ class EMILSWIGGLE_PT_head(EmilsWigglePanel, bpy.types.Panel):
         return _bone_ready(context) and not context.active_pose_bone.bone.use_connect
 
     def draw_header(self, context):
-        self.layout.prop(context.active_pose_bone.emils_wiggle, "use_head", text="Head")
+        self.layout.prop(context.active_pose_bone.emils_wiggle, "use_head", text="Jiggle")
 
     def draw(self, context):
         s = context.active_pose_bone.emils_wiggle

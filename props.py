@@ -163,7 +163,7 @@ class EmilsWiggleSideSettings(bpy.types.PropertyGroup):
         update=_upd("gravity_axis"))
     lock: BoolVectorProperty(
         name="Lock",
-        description="Freeze motion along the bone's local axis. For the tail only X and Z matter "
+        description="Freeze motion along the bone's local axis. For Swing only X and Z matter "
                     "(Y is along the bone, use Stretch for that)",
         size=3, default=(False, False, False), subtype="XYZ", override=OVR,
         update=_upd("lock"))
@@ -202,10 +202,13 @@ class EmilsWiggleSideSettings(bpy.types.PropertyGroup):
 class EmilsWiggleBoneSettings(bpy.types.PropertyGroup):
     mute: BoolProperty(name="Mute Bone", description="Mute wiggle on this bone",
                        default=False, override=OVR, update=_upd("mute", structure=True))
-    use_tail: BoolProperty(name="Tail", description="Wiggle this bone's tail (the bone swings)",
+    # shown as Swing and Jiggle, the identifiers stay tail/head so saved files keep working
+    use_tail: BoolProperty(name="Swing", description="The bone swings around its base, its tip lags "
+                                                     "behind (hair, ears, tails). Wiggle 2 called this Tail",
                            default=False, override=OVR, update=_upd("use_tail", structure=True))
-    use_head: BoolProperty(name="Head", description="Wiggle this bone's head (the bone moves). "
-                                                    "Not available on connected bones",
+    use_head: BoolProperty(name="Jiggle", description="The whole bone moves and bounces around its spot "
+                                                      "(belly, cheeks, dangling things). Not available on "
+                                                      "connected bones. Wiggle 2 called this Head",
                            default=False, override=OVR, update=_upd("use_head", structure=True))
     tail: PointerProperty(type=EmilsWiggleSideSettings, override=OVR)
     head: PointerProperty(type=EmilsWiggleSideSettings, override=OVR)
